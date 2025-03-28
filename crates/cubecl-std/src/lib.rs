@@ -8,6 +8,11 @@ pub use option::*;
 
 pub mod tensor;
 
+pub mod scan;
+
+#[cfg(feature = "export_tests")]
+pub mod test;
+
 use cubecl::prelude::*;
 use cubecl_core as cubecl;
 
