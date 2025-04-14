@@ -1,11 +1,8 @@
-use cubecl_common::ExecutionMode;
-use cubecl_runtime::{
-    TimestampsError, TimestampsResult,
-    server::{BindingWithMeta, ConstBinding},
-};
+use cubecl_common::{ExecutionMode, benchmark::ProfileDuration};
+use cubecl_runtime::kernel_timestamps::KernelTimestamps;
+use cubecl_runtime::server::{BindingWithMeta, Bindings};
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
 
 use super::DummyKernel;
 use cubecl_runtime::memory_management::MemoryUsage;
@@ -23,28 +20,6 @@ use cubecl_runtime::{
 pub struct DummyServer {
     memory_management: MemoryManagement<BytesStorage>,
     timestamps: KernelTimestamps,
-}
-
-#[derive(Debug)]
-enum KernelTimestamps {
-    Inferred { start_time: Instant },
-    Disabled,
-}
-
-impl KernelTimestamps {
-    fn enable(&mut self) {
-        if !matches!(self, Self::Disabled) {
-            return;
-        }
-
-        *self = Self::Inferred {
-            start_time: Instant::now(),
-        };
-    }
-
-    fn disable(&mut self) {
-        *self = Self::Disabled;
-    }
 }
 
 impl ComputeServer for DummyServer {
@@ -129,21 +104,23 @@ impl ComputeServer for DummyServer {
         &mut self,
         kernel: Self::Kernel,
         _count: CubeCount,
-        constants: Vec<ConstBinding>,
-        bindings: Vec<Binding>,
+        bindings: Bindings,
         _mode: ExecutionMode,
     ) {
-        let mut resources = constants
+        let mut resources: Vec<_> = bindings
+            .buffers
             .into_iter()
-            .map(|it| match it {
-                ConstBinding::TensorMap { binding, .. } => self.get_resource(binding),
-            })
+            .map(|b| self.get_resource(b))
+            .collect();
+        let metadata = self.create(bytemuck::cast_slice(&bindings.metadata.data));
+        resources.push(self.get_resource(metadata.binding()));
+
+        let scalars = bindings
+            .scalars
+            .into_values()
+            .map(|s| self.create(s.data()))
             .collect::<Vec<_>>();
-        resources.extend(
-            bindings
-                .into_iter()
-                .map(|binding| self.get_resource(binding)),
-        );
+        resources.extend(scalars.into_iter().map(|h| self.get_resource(h.binding())));
 
         let mut resources: Vec<_> = resources.iter().map(|x| x.resource()).collect();
 
@@ -159,20 +136,6 @@ impl ComputeServer for DummyServer {
         async move {}
     }
 
-    #[allow(clippy::manual_async_fn)]
-    fn sync_elapsed(&mut self) -> impl Future<Output = TimestampsResult> + 'static {
-        let duration = match &mut self.timestamps {
-            KernelTimestamps::Inferred { start_time } => {
-                let duration = start_time.elapsed();
-                *start_time = Instant::now();
-                Ok(duration)
-            }
-            KernelTimestamps::Disabled => Err(TimestampsError::Disabled),
-        };
-
-        async move { duration }
-    }
-
     fn memory_usage(&self) -> MemoryUsage {
         self.memory_management.memory_usage()
     }
@@ -181,12 +144,12 @@ impl ComputeServer for DummyServer {
         self.memory_management.cleanup(true);
     }
 
-    fn enable_timestamps(&mut self) {
-        self.timestamps.enable();
+    fn start_profile(&mut self) {
+        self.timestamps.start();
     }
 
-    fn disable_timestamps(&mut self) {
-        self.timestamps.disable();
+    fn end_profile(&mut self) -> ProfileDuration {
+        self.timestamps.stop()
     }
 }
 
@@ -194,7 +157,7 @@ impl DummyServer {
     pub fn new(memory_management: MemoryManagement<BytesStorage>) -> Self {
         Self {
             memory_management,
-            timestamps: KernelTimestamps::Disabled,
+            timestamps: KernelTimestamps::default(),
         }
     }
 }

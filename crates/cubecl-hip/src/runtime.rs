@@ -3,7 +3,9 @@ use std::{ffi::CStr, mem::MaybeUninit, str::FromStr};
 use cubecl_cpp::{
     hip::HipDialect,
     register_supported_types,
-    shared::{Architecture, CompilationOptions, CppCompiler, WmmaCompiler, register_wmma_features},
+    shared::{
+        Architecture, CompilationOptions, CppCompiler, DialectWmmaCompiler, register_wmma_features,
+    },
 };
 
 use cubecl_core::{
@@ -43,7 +45,7 @@ pub type HipCompiler = CppCompiler<HipDialect<HipWmmaCompiler>>;
 type Server = HipServer;
 type Channel = MutexComputeChannel<Server>;
 
-fn create_client<M: WmmaCompiler<HipDialect<M>>>(
+fn create_client<M: DialectWmmaCompiler<HipDialect<M>>>(
     device: &HipDevice,
     options: RuntimeOptions,
 ) -> ComputeClient<Server, Channel> {
@@ -125,6 +127,8 @@ fn create_client<M: WmmaCompiler<HipDialect<M>>>(
         max_cube_count,
         max_units_per_cube: prop_max_threads,
         max_cube_dim,
+        num_streaming_multiprocessors: None,
+        num_tensor_cores: None,
     };
     let memory_management =
         MemoryManagement::from_configuration(storage, &mem_properties, options.memory_config);
@@ -138,11 +142,15 @@ fn create_client<M: WmmaCompiler<HipDialect<M>>>(
     device_props.register_feature(Feature::AtomicFloat(AtomicFeature::LoadStore));
     device_props.register_feature(Feature::AtomicFloat(AtomicFeature::Add));
 
+    device_props.register_feature(Feature::DynamicLineSize);
+
     let supported_wmma_combinations = M::supported_wmma_combinations(&arch);
     register_wmma_features(supported_wmma_combinations, &mut device_props);
 
     let comp_opts = CompilationOptions {
         warp_size: arch.warp_size(),
+        grid_constants: false,
+        supports_clusters: false,
     };
     let hip_ctx = HipContext::new(memory_management, comp_opts, stream);
     let server = HipServer::new(hip_ctx);

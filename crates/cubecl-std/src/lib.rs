@@ -1,5 +1,10 @@
 //! Cubecl standard library.
 
+mod reinterpret_slice;
+pub use reinterpret_slice::*;
+mod fast_math;
+pub use fast_math::*;
+
 mod quantization;
 pub use quantization::*;
 
@@ -10,6 +15,9 @@ pub mod tensor;
 
 use cubecl::prelude::*;
 use cubecl_core as cubecl;
+
+#[cfg(feature = "export_tests")]
+pub mod tests;
 
 #[cube]
 #[allow(clippy::manual_div_ceil)]

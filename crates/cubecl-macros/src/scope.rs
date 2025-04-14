@@ -9,7 +9,7 @@ use syn::{Ident, Type, parse_quote};
 
 use crate::parse::kernel::KernelParam;
 
-pub const KEYWORDS: [&str; 22] = [
+pub const KEYWORDS: [&str; 30] = [
     "ABSOLUTE_POS",
     "ABSOLUTE_POS_X",
     "ABSOLUTE_POS_Y",
@@ -32,6 +32,14 @@ pub const KEYWORDS: [&str; 22] = [
     "CUBE_COUNT_Z",
     "PLANE_DIM",
     "UNIT_POS_PLANE",
+    "CLUSTER_DIM",
+    "CLUSTER_DIM_X",
+    "CLUSTER_DIM_Y",
+    "CLUSTER_DIM_Z",
+    "CUBE_POS_CLUSTER",
+    "CUBE_POS_CLUSTER_X",
+    "CUBE_POS_CLUSTER_Y",
+    "CUBE_POS_CLUSTER_Z",
 ];
 
 pub type Scope = usize;
@@ -43,10 +51,11 @@ pub struct Context {
     scopes: Vec<ManagedScope>,
     level: usize,
     mut_scope_idx: usize,
+    pub debug_symbols: bool,
 }
 
 impl Context {
-    pub fn new(return_type: Type) -> Self {
+    pub fn new(return_type: Type, debug_symbols: bool) -> Self {
         let mut root_scope = ManagedScope::default();
         root_scope.extend(KEYWORDS.iter().map(|it| {
             let name = format_ident!("{it}");
@@ -67,6 +76,7 @@ impl Context {
             scopes: vec![root_scope],
             level: 0,
             mut_scope_idx: 0,
+            debug_symbols,
         }
     }
 

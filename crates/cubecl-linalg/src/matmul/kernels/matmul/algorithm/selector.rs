@@ -1,30 +1,70 @@
+use std::cmp::min;
+
+use cubecl_core::prelude::TensorHandleRef;
 use cubecl_core::{Feature, Runtime, client::ComputeClient, ir::Elem, prelude::CubePrimitive};
 use cubecl_runtime::DeviceProperties;
 
+use crate::matmul::components::{InputRuntimeArg, OutputRuntimeArg};
 use crate::matmul::{
     components::{
-        CompleteStageTiling, InputRuntimeArg, MatmulProblem, MatmulSelection, MatmulSize,
-        MatmulSpec, OutputRuntimeArg, stage, tile::TileMatmulFamily,
+        CompleteStageTiling, InputArg, MatmulPrecision, MatmulProblem, MatmulSelection, MatmulSize,
+        MatmulSpec, OutputArg,
+        global::args::{ConcreteInputsFactory, ConcreteOutputFactory},
+        stage::STAGE_BUFFERING,
+        tile::TileMatmulFamily,
     },
     kernels::{MatmulLaunchError, matmul::base::matmul_cube_preparation},
 };
 
 use super::Algorithm;
 
-const NUM_SM_APPROX: usize = 50;
-const NUM_TENSOR_CORES_APPROX: usize = 8;
+pub(crate) const NUM_SM_APPROX: u32 = 50;
+pub(crate) const NUM_TENSOR_CORES_APPROX: u32 = 4;
+const NUM_PLANES_PER_TENSOR_CORES: u32 = 2;
 
 /// Select which kernel to launch for the given Algorithm.
+///
+/// Only works for concrete tensor inputs and output.
 #[allow(clippy::result_large_err)]
-pub fn select_kernel<'a, MS: MatmulSpec, R: Runtime, A: Algorithm>(
+pub fn select_kernel_concrete<MS: MatmulSpec, R: Runtime, A: Algorithm>(
+    client: &ComputeClient<R::Server, R::Channel>,
+    lhs: &TensorHandleRef<'_, R>,
+    rhs: &TensorHandleRef<'_, R>,
+    out: &TensorHandleRef<'_, R>,
+    problem: MatmulProblem,
+    plane_dim: u32,
+) -> Result<(), MatmulLaunchError>
+where
+    InputArg<MS>: ConcreteInputsFactory,
+    OutputArg<MS>: ConcreteOutputFactory,
+{
+    let selection =
+        matmul_selection::<A::TileMatmul, MS::Precision, R>(client, &problem, plane_dim);
+    let config_input = CompleteStageTiling {
+        tile_shape: selection.tile_shape,
+        tile_count: selection.tile_count,
+    };
+
+    matmul_cube_preparation::<MS, R, A>(
+        client,
+        <InputArg<MS> as ConcreteInputsFactory>::create(lhs, rhs, &selection, &problem),
+        <OutputArg<MS> as ConcreteOutputFactory>::create(out, &selection, &problem),
+        problem,
+        (config_input, STAGE_BUFFERING),
+        selection,
+    )
+}
+
+/// Select which kernel to launch for the given Algorithm.
+pub fn select_kernel_virtual<'a, MS: MatmulSpec, R: Runtime, A: Algorithm>(
     client: &ComputeClient<R::Server, R::Channel>,
     input: InputRuntimeArg<'a, MS, R>,
     output: OutputRuntimeArg<'a, MS, R>,
     problem: MatmulProblem,
     plane_dim: u32,
-    quantized: bool,
 ) -> Result<(), MatmulLaunchError> {
-    let selection = matmul_selection::<A::TileMatmul, MS, R>(client, &problem, plane_dim);
+    let selection =
+        matmul_selection::<A::TileMatmul, MS::Precision, R>(client, &problem, plane_dim);
     let config_input = CompleteStageTiling {
         tile_shape: selection.tile_shape,
         tile_count: selection.tile_count,
@@ -35,9 +75,8 @@ pub fn select_kernel<'a, MS: MatmulSpec, R: Runtime, A: Algorithm>(
         input,
         output,
         problem,
-        (config_input, stage::Buffering::Double), // TODO support double buffering
+        (config_input, STAGE_BUFFERING),
         selection,
-        quantized,
     )
 }
 
@@ -77,11 +116,13 @@ pub(crate) fn find_stage_size_m_n(
     n: usize,
     num_batches: usize,
     num_sm: usize,
-    max_tensor_cores: usize,
+    virtual_tensor_cores: usize,
     instruction_m: usize,
     instruction_n: usize,
 ) -> usize {
-    let mut dim_num_tiles = max_tensor_cores;
+    let min_inst = instruction_m.min(instruction_n);
+    let max_tiles = 256 / min_inst;
+    let mut dim_num_tiles = virtual_tensor_cores.min(max_tiles);
 
     let total_tiles_m = (m + instruction_m - 1) / instruction_m;
     let total_tiles_n = (n + instruction_n - 1) / instruction_n;
@@ -118,7 +159,7 @@ pub(crate) fn find_stage_size_m_n(
     }
 }
 
-pub(crate) fn matmul_selection<TMM: TileMatmulFamily, MS: MatmulSpec, R: Runtime>(
+pub fn matmul_selection<TMM: TileMatmulFamily, MP: MatmulPrecision, R: Runtime>(
     client: &ComputeClient<R::Server, R::Channel>,
     problem: &MatmulProblem,
     plane_dim: u32,
@@ -128,9 +169,9 @@ pub(crate) fn matmul_selection<TMM: TileMatmulFamily, MS: MatmulSpec, R: Runtime
             Some((
                 client.properties(),
                 (
-                    MS::ES::as_elem_native_unchecked(),
-                    MS::ES::as_elem_native_unchecked(),
-                    MS::EA::as_elem_native_unchecked(),
+                    MP::ES::as_elem_native_unchecked(),
+                    MP::ES::as_elem_native_unchecked(),
+                    MP::EA::as_elem_native_unchecked(),
                 ),
             ))
         } else {
@@ -140,12 +181,24 @@ pub(crate) fn matmul_selection<TMM: TileMatmulFamily, MS: MatmulSpec, R: Runtime
         problem.n,
     );
 
+    let num_tensor_cores = client
+        .properties()
+        .hardware_properties()
+        .num_tensor_cores
+        .unwrap_or(NUM_TENSOR_CORES_APPROX);
+    // Going over 8 does not work well for now
+    let virtual_tensor_cores = min(8, num_tensor_cores * NUM_PLANES_PER_TENSOR_CORES) as usize;
+
     let stage_size_m_n = find_stage_size_m_n(
         problem.m,
         problem.n,
         problem.num_batches(),
-        NUM_SM_APPROX,
-        NUM_TENSOR_CORES_APPROX,
+        client
+            .properties()
+            .hardware_properties()
+            .num_streaming_multiprocessors
+            .unwrap_or(NUM_SM_APPROX) as usize,
+        virtual_tensor_cores,
         instruction_m,
         instruction_n,
     );

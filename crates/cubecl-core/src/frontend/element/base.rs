@@ -152,7 +152,7 @@ pub trait LaunchArg: LaunchArgExpand + Send + Sync + 'static {
 
 /// Defines the argument settings used to launch a kernel.
 pub trait ArgSettings<R: Runtime>: Send + Sync {
-    /// Register the information to the [KernelLauncher].
+    /// Register the information of an argument to the [KernelLauncher].
     fn register(&self, launcher: &mut KernelLauncher<R>);
 }
 
@@ -161,6 +161,18 @@ pub trait ArgSettings<R: Runtime>: Send + Sync {
 pub struct ExpandElementTyped<T: CubeType> {
     pub(crate) expand: ExpandElement,
     pub(crate) _type: PhantomData<T>,
+}
+
+impl<T: CubeType> From<&ExpandElementTyped<T>> for ExpandElementTyped<T> {
+    fn from(value: &ExpandElementTyped<T>) -> Self {
+        value.clone()
+    }
+}
+
+impl<T: CubeType> From<&mut ExpandElementTyped<T>> for ExpandElementTyped<T> {
+    fn from(value: &mut ExpandElementTyped<T>) -> Self {
+        value.clone()
+    }
 }
 
 macro_rules! from_const {

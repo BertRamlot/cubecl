@@ -1,13 +1,14 @@
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 
-use super::{Reduce, ReduceCoordinate, MonoidOperation};
+use super::{ReduceCoordinate, ReduceFamily, MonoidOperation, ReduceRequirements};
 
-#[derive(Debug)]
-pub struct Sum;
+#[derive(Debug, CubeType, Clone)]
+pub struct Sum {}
 
-impl Reduce for Sum {
+impl ReduceFamily for Sum {
     type Instruction<In: Numeric> = Self;
+    type Config = ();
 }
 
 #[cube]
@@ -16,20 +17,33 @@ impl<In: Numeric> MonoidOperation<In> for Sum {
 
     type AccumulatorItem = Line<In>;
     type SharedAccumulator = SharedMemory<Line<In>>;
+    type Config = ();
 
-    fn identity_input(#[comptime] line_size: u32) -> Line<In> {
+    fn requirements(_this: &Self) -> ReduceRequirements {
+        ReduceRequirements { coordinates: false }
+    }
+
+    fn from_config(_config: Self::Config) -> Self {
+        Sum {}
+    }
+    fn identity_input(_this: &Self, #[comptime] line_size: u32) -> Line<In> {
         Line::empty(line_size).fill(In::from_int(0))
     }
 
-    fn identity_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem {
-        Self::identity_input(line_size)
+    fn identity_accumulator(this: &Self, #[comptime] line_size: u32) -> Self::AccumulatorItem {
+        Self::identity_input(this, line_size)
     }
 
-    fn assign_accumulator(destination: &mut Self::AccumulatorItem, source: &Self::AccumulatorItem) {
+    fn assign_accumulator(
+        _this: &Self,
+        destination: &mut Self::AccumulatorItem,
+        source: &Self::AccumulatorItem,
+    ) {
         *destination = *source;
     }
 
     fn operate(
+        _this: &Self,
         accumulator: &Self::AccumulatorItem,
         item: Line<In>,
         _coordinate: ReduceCoordinate,
@@ -43,6 +57,7 @@ impl<In: Numeric> MonoidOperation<In> for Sum {
     }
 
     fn fuse_accumulators(
+        _this: &Self,
         lhs: Self::AccumulatorItem,
         rhs: Self::AccumulatorItem,
     ) -> Self::AccumulatorItem {
@@ -50,6 +65,7 @@ impl<In: Numeric> MonoidOperation<In> for Sum {
     }
 
     fn merge_line<Out: Numeric>(
+        _this: &Self,
         accumulator: Self::AccumulatorItem,
         _shape_axis_reduce: u32,
     ) -> Out {
@@ -62,6 +78,7 @@ impl<In: Numeric> MonoidOperation<In> for Sum {
     }
 
     fn to_output_perpendicular<Out: Numeric>(
+        _this: &Self,
         accumulator: Self::AccumulatorItem,
         _shape_axis_reduce: u32,
     ) -> Line<Out> {

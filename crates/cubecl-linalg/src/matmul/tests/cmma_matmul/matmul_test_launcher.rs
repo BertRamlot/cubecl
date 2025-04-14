@@ -8,17 +8,17 @@ use crate::matmul::components::MatmulLaunch;
 use crate::matmul::components::MatmulProblem;
 use crate::matmul::components::MatmulSelection;
 use crate::matmul::components::MatrixLayout;
-use crate::matmul::components::SingleMatmulSpec;
 use crate::matmul::components::global::args::TensorInputsLaunch;
 use crate::matmul::kernels::matmul::Algorithm;
 use crate::matmul::tests::test_utils::Sample;
 use crate::matmul::tests::test_utils::TestPrecision;
 
-struct TensorRawParts<N: Numeric + CubeElement> {
-    handle: server::Handle,
-    shape: Vec<usize>,
-    strides: Vec<usize>,
-    original_data: Option<Vec<N>>,
+#[derive(Debug)]
+pub(crate) struct TensorRawParts<N: Numeric + CubeElement> {
+    pub handle: server::Handle,
+    pub shape: Vec<usize>,
+    pub strides: Vec<usize>,
+    pub original_data: Option<Vec<N>>,
 }
 
 /// Test the correctness of the specified Matmul on the given device,
@@ -51,13 +51,19 @@ pub fn test_matmul_algorithm<A, P, R>(
         R::line_size_elem(&P::EG::as_elem_native_unchecked()),
         &lhs.shape,
         &lhs.strides,
-        lhs.strides.len() - 1,
+        match problem.lhs_layout {
+            MatrixLayout::RowMajor => lhs.strides.len() - 1,
+            MatrixLayout::ColMajor => lhs.strides.len() - 2,
+        },
     );
     problem.rhs_line_size = tensor_line_size_parallel(
         R::line_size_elem(&P::EG::as_elem_native_unchecked()),
         &rhs.shape,
         &rhs.strides,
-        rhs.strides.len() - 1,
+        match problem.rhs_layout {
+            MatrixLayout::RowMajor => lhs.strides.len() - 1,
+            MatrixLayout::ColMajor => lhs.strides.len() - 2,
+        },
     );
     problem.out_line_size = tensor_line_size_parallel(
         R::line_size_elem(&P::EG::as_elem_native_unchecked()),
@@ -82,7 +88,7 @@ pub fn test_matmul_algorithm<A, P, R>(
         }
     };
 
-    if let Err(err) = A::check_availability::<R, (P::EG, P::ES, f32)>(&client, &config) {
+    if let Err(err) = A::check_availability::<R, (P::EG, P::ES, f32, P::EG)>(&client, &config) {
         let msg = format!("Skipped - not supported: {:?}", err);
         if panic_on_launch_err {
             panic!("{msg}")
@@ -94,7 +100,7 @@ pub fn test_matmul_algorithm<A, P, R>(
     }
 
     unsafe {
-        A::BatchMatmul::launch_unchecked::<SingleMatmulSpec<P::EG, P::ES, P::EA>, R>(
+        A::BatchMatmul::launch_unchecked::<(P::EG, P::ES, P::EA, P::EG), R>(
             &client,
             cube_dim,
             cube_count,
@@ -213,7 +219,7 @@ fn tensor_raw_parts<P: TestPrecision, R: Runtime>(
     }
 }
 
-fn transpose<E: Copy>(array: &[E], batches: usize, rows: usize, cols: usize) -> Vec<E> {
+pub(crate) fn transpose<E: Copy>(array: &[E], batches: usize, rows: usize, cols: usize) -> Vec<E> {
     let mut result = vec![array[0]; array.len()];
     for b in 0..batches {
         for i in 0..rows {
@@ -226,7 +232,7 @@ fn transpose<E: Copy>(array: &[E], batches: usize, rows: usize, cols: usize) -> 
 }
 
 /// Returns the total number of elements for the identified tensor, inferred by the problem definition
-fn tensor_size(problem: &MatmulProblem, ident: Ident) -> usize {
+pub(crate) fn tensor_size(problem: &MatmulProblem, ident: Ident) -> usize {
     match ident {
         Ident::Lhs => problem.num_batches() * problem.m * problem.k,
         Ident::Rhs => problem.num_batches() * problem.k * problem.n,
@@ -235,7 +241,7 @@ fn tensor_size(problem: &MatmulProblem, ident: Ident) -> usize {
 }
 
 /// Returns the shape of the identified tensor, inferred by the problem definition
-fn shape(problem: &MatmulProblem, ident: Ident) -> Vec<usize> {
+pub(crate) fn shape(problem: &MatmulProblem, ident: Ident) -> Vec<usize> {
     match ident {
         Ident::Lhs => problem
             .batches

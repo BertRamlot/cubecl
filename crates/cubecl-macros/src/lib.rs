@@ -76,14 +76,22 @@ fn cube_impl(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream> 
         }
         Item::Impl(item_impl) => {
             if item_impl.trait_.is_some() {
-                let mut expand_impl = CubeTraitImpl::from_item_impl(item_impl, args.src_file)?;
+                let mut expand_impl = CubeTraitImpl::from_item_impl(
+                    item_impl,
+                    args.src_file,
+                    args.debug_symbols.is_present(),
+                )?;
                 let expand_impl = expand_impl.to_tokens_mut();
 
                 Ok(TokenStream::from(quote! {
                     #expand_impl
                 }))
             } else {
-                let mut expand_impl = CubeImpl::from_item_impl(item_impl, args.src_file)?;
+                let mut expand_impl = CubeImpl::from_item_impl(
+                    item_impl,
+                    args.src_file,
+                    args.debug_symbols.is_present(),
+                )?;
                 let expand_impl = expand_impl.to_tokens_mut();
 
                 Ok(TokenStream::from(quote! {
@@ -166,6 +174,26 @@ pub fn comptime(input: TokenStream) -> TokenStream {
     quote![{ #tokens }].into()
 }
 
+/// Makes the function return a compile time value
+/// Useful in a cube trait to have a part of the trait return comptime values
+///
+/// # Example
+/// ```ignored
+/// #use cubecl_macros::cube;
+/// #[cube]
+/// fn do_stuff(#[comptime] input: u32) -> comptime_type!(u32) {
+///     input + 5   
+/// }
+/// ```
+///
+/// TODO: calling a trait method returning comptime_type from
+/// within another trait method does not work
+#[proc_macro]
+pub fn comptime_type(input: TokenStream) -> TokenStream {
+    let tokens: proc_macro2::TokenStream = input.into();
+    quote![ #tokens ].into()
+}
+
 /// Insert a literal comment into the kernel source code.
 ///
 /// # Example
@@ -202,6 +230,7 @@ pub fn terminate(input: TokenStream) -> TokenStream {
     let tokens: proc_macro2::TokenStream = input.into();
     quote![{ #tokens }].into()
 }
+
 /// Implements display and initialization for autotune keys.
 ///
 /// # Helper

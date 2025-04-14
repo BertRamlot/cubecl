@@ -1,4 +1,4 @@
-use super::{AutotuneKey, TunableSet, Tuner};
+use super::{AutotuneKey, AutotuneOutput, TunableSet, Tuner};
 use crate::{
     channel::ComputeChannel, client::ComputeClient, server::ComputeServer, tune::TuneCacheResult,
 };
@@ -43,8 +43,23 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
         *state = None;
     }
 
+    #[cfg(feature = "autotune-checks")]
+    fn checks<In: Send + Clone + 'static, Out: AutotuneOutput>(
+        &self,
+        operations: &TunableSet<AK, In, Out>,
+        inputs: &In,
+    ) {
+        let mut checks_outputs = Vec::new();
+        for i in 0..operations.len() {
+            let op = operations.fastest(i);
+            let result = op.execute(inputs.clone());
+            checks_outputs.push(result);
+        }
+        super::check_autotune_outputs(checks_outputs);
+    }
+
     /// Execute the best operation in the provided [tunable set](TunableSet)
-    pub fn execute<S, C, In: Send + Clone + 'static, Out: Send + 'static>(
+    pub fn execute<S, C, In: Send + Clone + 'static, Out: AutotuneOutput>(
         &self,
         id: &ID,
         client: &ComputeClient<S, C>,
@@ -61,10 +76,15 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
         if let Some(map) = self.state.read().as_ref() {
             if let Some(tuner) = map.get(id) {
                 if let TuneCacheResult::Hit { fastest_index } = tuner.fastest(&key) {
+                    #[cfg(feature = "autotune-checks")]
+                    self.checks(operations, &inputs);
+
                     let op = operations.fastest(fastest_index);
-                    return op
+                    let result = op
                         .execute(inputs)
                         .expect("Should run when selected by autotune.");
+
+                    return result;
                 }
             }
         }
@@ -100,6 +120,9 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
 
         match fastest {
             TuneCacheResult::Hit { fastest_index } => {
+                #[cfg(feature = "autotune-checks")]
+                self.checks(operations, &inputs);
+
                 return operations
                     .fastest(fastest_index)
                     .execute(inputs)
@@ -121,9 +144,10 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
                     // - tune_1 save
                     // ```
                     let state = self.state.read();
-                    let state = state.as_ref().expect("Should be initialized");
-                    let tuner = state.get(id).expect("Should be initialized");
-
+                    let tuner = state
+                        .as_ref()
+                        .and_then(|s| s.get(id))
+                        .expect("Should be initialized");
                     tuner.execute_autotune(key.clone(), &inputs, operations, client);
                 } else {
                     // We're waiting for results to come in.
@@ -139,11 +163,13 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
 
         let fastest = {
             let mut state = self.state.write();
-            let state = state.as_mut().expect("Should be initialized");
-            let tuner = state.get_mut(id).expect("Should be initialized");
+            let tuner = state
+                .as_mut()
+                .and_then(|s| s.get_mut(id))
+                .expect("Should be initialized");
 
-            // Now read all results that have come in since.
-            tuner.resolve();
+            // Read all results that have come in since.
+            tuner.handle_results();
 
             // Check again what the fastest option is, new results might have come in.
             match tuner.fastest(&key) {
@@ -159,11 +185,10 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
                     if run_autotune {
                         panic!("Should have at least started autotuning");
                     } else {
-                        // Another worker is responsible for running autotuning.
-                        // Let's execute the default index while we wait for the results.
+                        // We're still waiting for the results of the autotune task.
+                        // Let's execute the default index while we wait.
                         //
-                        // This should only happen on wasm since we can't block or trigger a new
-                        // context switch manually to prioritize finishing the autotune task.
+                        // This should only happen on wasm since we can't block waiting on the results there.
                         0
                     }
                 }
@@ -172,6 +197,9 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
                 }
             }
         };
+
+        #[cfg(feature = "autotune-checks")]
+        self.checks(operations, &inputs);
 
         operations
             .fastest(fastest)

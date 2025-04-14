@@ -1,6 +1,7 @@
 use cubecl_ir::{
     Arithmetic, AtomicOp, BarrierOps, BinaryOperator, Bitwise, Comparison, CoopMma, Instruction,
-    Metadata, Operation, Operator, PipelineOps, Plane, TmaOps, UnaryOperator, Variable,
+    Metadata, NonSemantic, Operation, Operator, PipelineOps, Plane, TmaOps, UnaryOperator,
+    Variable,
 };
 
 use super::Optimizer;
@@ -45,13 +46,16 @@ impl Optimizer {
             Operation::Atomic(atomic) => self.visit_atomic(atomic, out, visit_read),
             Operation::Metadata(meta) => self.visit_meta(meta, visit_read),
             // Sync has no outputs
-            Operation::Synchronization(_) | Operation::NonSemantic(_) => {}
+            Operation::Synchronization(_) => {}
             Operation::Plane(plane) => self.visit_plane(plane, visit_read),
             Operation::CoopMma(coop_mma) => self.visit_cmma(coop_mma, visit_read),
             Operation::Branch(_) => unreachable!(),
             Operation::Pipeline(pipeline_ops) => self.visit_pipeline(pipeline_ops, visit_read),
             Operation::Barrier(barrier_ops) => self.visit_barrier(barrier_ops, visit_read),
             Operation::Tma(tma_ops) => self.visit_tma(tma_ops, visit_read),
+            Operation::NonSemantic(non_semantic) => {
+                self.visit_nonsemantic(non_semantic, visit_read)
+            }
         }
     }
 
@@ -77,7 +81,8 @@ impl Optimizer {
             | Arithmetic::Max(binary_operator)
             | Arithmetic::Min(binary_operator)
             | Arithmetic::Remainder(binary_operator)
-            | Arithmetic::Dot(binary_operator) => self.visit_binop(binary_operator, visit_read),
+            | Arithmetic::Dot(binary_operator)
+            | Arithmetic::MulHi(binary_operator) => self.visit_binop(binary_operator, visit_read),
 
             Arithmetic::Abs(unary_operator)
             | Arithmetic::Exp(unary_operator)
@@ -161,11 +166,14 @@ impl Optimizer {
             | Operator::Or(binary_operator) => self.visit_binop(binary_operator, visit_read),
             Operator::Not(unary_operator)
             | Operator::Cast(unary_operator)
-            | Operator::Bitcast(unary_operator) => self.visit_unop(unary_operator, visit_read),
+            | Operator::Reinterpret(unary_operator) => self.visit_unop(unary_operator, visit_read),
             Operator::Slice(slice_operator) => {
                 visit_read(self, &mut slice_operator.start);
                 visit_read(self, &mut slice_operator.end);
                 visit_read(self, &mut slice_operator.input);
+            }
+            Operator::ReinterpretSlice(_) => {
+                todo!()
             }
             Operator::InitLine(line_init_operator) => {
                 for input in &mut line_init_operator.inputs {
@@ -332,7 +340,7 @@ impl Optimizer {
                 visit_read(self, barrier);
                 visit_read(self, source);
             }
-            BarrierOps::MemCopyAsyncTensorGlobalToShared {
+            BarrierOps::TmaLoad {
                 barrier,
                 tensor_map,
                 indices,
@@ -341,6 +349,21 @@ impl Optimizer {
                 visit_read(self, tensor_map);
                 for index in indices {
                     visit_read(self, index);
+                }
+            }
+            BarrierOps::TmaLoadIm2col {
+                barrier,
+                tensor_map,
+                indices,
+                offsets,
+            } => {
+                visit_read(self, barrier);
+                visit_read(self, tensor_map);
+                for index in indices {
+                    visit_read(self, index);
+                }
+                for offset in offsets {
+                    visit_read(self, offset);
                 }
             }
             BarrierOps::ArriveAndWait { barrier } => visit_read(self, barrier),
@@ -373,7 +396,7 @@ impl Optimizer {
         mut visit_read: impl FnMut(&mut Self, &mut Variable),
     ) {
         match tma_ops {
-            TmaOps::MemCopyAsyncTensorToGlobal {
+            TmaOps::TmaStore {
                 source,
                 coordinates,
             } => {
@@ -383,6 +406,23 @@ impl Optimizer {
                 }
             }
             TmaOps::CommitGroup | TmaOps::WaitGroup { .. } | TmaOps::WaitGroupRead { .. } => {}
+        }
+    }
+
+    fn visit_nonsemantic(
+        &mut self,
+        non_semantic: &mut NonSemantic,
+        mut visit_read: impl FnMut(&mut Self, &mut Variable),
+    ) {
+        match non_semantic {
+            NonSemantic::Comment { .. }
+            | NonSemantic::EnterDebugScope
+            | NonSemantic::ExitDebugScope => {}
+            NonSemantic::Print { args, .. } => {
+                for arg in args {
+                    visit_read(self, arg);
+                }
+            }
         }
     }
 

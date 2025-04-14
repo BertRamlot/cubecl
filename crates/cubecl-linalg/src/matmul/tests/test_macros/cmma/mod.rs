@@ -7,7 +7,7 @@ macro_rules! testgen_matmul_accelerated {
     ($eg:ty, $es:ty) => {
         type Precision = ($eg, $es);
 
-        $crate::matmul_standard_tests!();
+        $crate::matmul_standard_tests!(standard);
     };
 
     ([$($float:ident),*]) => {
@@ -19,10 +19,33 @@ macro_rules! testgen_matmul_accelerated {
             ::paste::paste! {
                 $(mod [<$float _ty>] {
                     use super::*;
-                    $crate::testgen_matmul_accelerated!($float, half::f16);
+                    $crate::testgen_matmul_accelerated!($float, $float);
                 })*
             }
         }
+    };
+}
+
+#[macro_export]
+macro_rules! testgen_matmul_tma {
+    ([$($float:ident: $stage: ident),*]) => {
+        #[allow(non_snake_case)]
+        mod matmul_tma {
+            use super::*;
+            type TMM = $crate::matmul::components::tile::accelerated::Accelerated;
+
+            ::paste::paste! {
+                $(mod [<$float _ty>] {
+                    use super::*;
+                    $crate::testgen_matmul_tma!($float, $stage);
+                })*
+            }
+        }
+    };
+    ($eg:ty, $es:ty) => {
+        type Precision = ($eg, $es);
+
+        $crate::matmul_standard_tests!(tma);
     };
 }
 
@@ -36,7 +59,7 @@ macro_rules! testgen_matmul_quantized {
             type Precision = $crate::matmul::tests::SymQ8;
             type TMM = $crate::matmul::components::tile::accelerated::Accelerated;
 
-            $crate::matmul_standard_tests!();
+            $crate::matmul_standard_tests!(standard);
         }
     };
 }
@@ -46,7 +69,7 @@ macro_rules! testgen_matmul_plane {
     ($float:ident) => {
         type Precision = ($eg, $es);
 
-        $crate::matmul_standard_tests!();
+        $crate::matmul_standard_tests!(standard);
     };
 
     ([$($float:ident),*]) => {

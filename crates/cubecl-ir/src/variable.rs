@@ -101,6 +101,10 @@ pub enum Builtin {
     UnitPosX,
     UnitPosY,
     UnitPosZ,
+    CubePosCluster,
+    CubePosClusterX,
+    CubePosClusterY,
+    CubePosClusterZ,
     CubePos,
     CubePosX,
     CubePosY,
@@ -109,6 +113,10 @@ pub enum Builtin {
     CubeDimX,
     CubeDimY,
     CubeDimZ,
+    CubeClusterDim,
+    CubeClusterDimX,
+    CubeClusterDimY,
+    CubeClusterDimZ,
     CubeCount,
     CubeCountX,
     CubeCountY,
@@ -443,12 +451,13 @@ impl Variable {
     pub fn index(&self) -> Option<Id> {
         match self.kind {
             VariableKind::GlobalInputArray(id)
+            | VariableKind::GlobalOutputArray(id)
+            | VariableKind::TensorMap(id)
             | VariableKind::GlobalScalar(id)
             | VariableKind::LocalMut { id, .. }
             | VariableKind::Versioned { id, .. }
             | VariableKind::LocalConst { id, .. }
             | VariableKind::Slice { id, .. }
-            | VariableKind::GlobalOutputArray(id)
             | VariableKind::ConstantArray { id, .. }
             | VariableKind::SharedMemory { id, .. }
             | VariableKind::LocalArray { id, .. }

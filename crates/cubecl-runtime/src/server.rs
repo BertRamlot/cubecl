@@ -6,9 +6,10 @@ use crate::{
     storage::{BindingResource, ComputeStorage},
     tma::{OobFill, TensorMapFormat, TensorMapInterleave, TensorMapPrefetch, TensorMapSwizzle},
 };
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::{fmt::Debug, future::Future};
-use cubecl_common::{ExecutionMode, benchmark::TimestampsResult};
+use cubecl_common::{ExecutionMode, benchmark::ProfileDuration};
 use cubecl_ir::Elem;
 
 /// The compute server is responsible for handling resources and computations over resources.
@@ -79,8 +80,7 @@ where
         &mut self,
         kernel: Self::Kernel,
         count: CubeCount,
-        constants: Vec<ConstBinding>,
-        bindings: Vec<Binding>,
+        bindings: Bindings,
         kind: ExecutionMode,
     );
 
@@ -90,11 +90,6 @@ where
     /// Wait for the completion of every task in the server.
     fn sync(&mut self) -> impl Future<Output = ()> + Send + 'static;
 
-    /// Wait for the completion of every task in the server.
-    ///
-    /// Returns the (approximate) total amount of GPU work done since the last sync.
-    fn sync_elapsed(&mut self) -> impl Future<Output = TimestampsResult> + Send + 'static;
-
     /// The current memory usage of the server.
     fn memory_usage(&self) -> MemoryUsage;
 
@@ -102,10 +97,10 @@ where
     fn memory_cleanup(&mut self);
 
     /// Enable collecting timestamps.
-    fn enable_timestamps(&mut self);
+    fn start_profile(&mut self);
 
     /// Disable collecting timestamps.
-    fn disable_timestamps(&mut self);
+    fn end_profile(&mut self) -> ProfileDuration;
 }
 
 /// Server handle containing the [memory handle](crate::server::Handle).
@@ -149,6 +144,92 @@ impl Handle {
     }
 }
 
+/// Bindings to execute a kernel.
+#[derive(Debug, Default)]
+pub struct Bindings {
+    /// Buffer bindings
+    pub buffers: Vec<Binding>,
+    /// Packed metadata for tensor bindings (len, shape, stride, etc).
+    /// Ordered by inputs, then outputs, then tensormaps
+    pub metadata: MetadataBinding,
+    /// Scalar bindings
+    pub scalars: BTreeMap<Elem, ScalarBinding>,
+    /// Tensor map bindings
+    pub tensor_maps: Vec<TensorMapBinding>,
+}
+
+impl Bindings {
+    /// Create a new bindings struct
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a buffer binding
+    pub fn with_buffer(mut self, binding: Binding) -> Self {
+        self.buffers.push(binding);
+        self
+    }
+
+    /// Extend the buffers with `bindings`
+    pub fn with_buffers(mut self, bindings: Vec<Binding>) -> Self {
+        self.buffers.extend(bindings);
+        self
+    }
+
+    /// Add a scalar parameter
+    pub fn with_scalar(mut self, elem: Elem, length: usize, data: Vec<u64>) -> Self {
+        self.scalars
+            .insert(elem, ScalarBinding::new(elem, length, data));
+        self
+    }
+
+    /// Extend the scalars with `bindings`
+    pub fn with_scalars(mut self, bindings: Vec<ScalarBinding>) -> Self {
+        self.scalars
+            .extend(bindings.into_iter().map(|binding| (binding.elem, binding)));
+        self
+    }
+
+    /// Set the metadata to `meta`
+    pub fn with_metadata(mut self, meta: MetadataBinding) -> Self {
+        self.metadata = meta;
+        self
+    }
+
+    /// Extend the tensor maps with `bindings`
+    pub fn with_tensor_maps(mut self, bindings: Vec<TensorMapBinding>) -> Self {
+        self.tensor_maps.extend(bindings);
+        self
+    }
+}
+
+/// Binding of a set of scalars of the same type to execute a kernel.
+#[derive(new, Debug, Default)]
+pub struct MetadataBinding {
+    /// Metadata values
+    pub data: Vec<u32>,
+    /// Length of the static portion (rank, len, buffer_len, shape_offsets, stride_offsets).
+    pub static_len: usize,
+}
+
+/// Binding of a set of scalars of the same type to execute a kernel.
+#[derive(new, Debug)]
+pub struct ScalarBinding {
+    /// Type of the scalars
+    pub elem: Elem,
+    /// Unpadded length of the underlying data
+    pub length: usize,
+    /// Type-erased data of the scalars. Padded and represented by u64 to prevent misalignment.
+    pub data: Vec<u64>,
+}
+
+impl ScalarBinding {
+    /// Get data as byte slice
+    pub fn data(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.data)
+    }
+}
+
 /// Binding of a [tensor handle](Handle) to execute a kernel.
 #[derive(new, Debug)]
 pub struct Binding {
@@ -173,16 +254,13 @@ pub struct BindingWithMeta {
     pub elem_size: usize,
 }
 
-/// Binding of a grid constant to execute a kernel.
+/// A tensor map used with TMA ops
 #[derive(new, Debug, Clone)]
-pub enum ConstBinding {
-    /// A tensor map used for TMA loading ops
-    TensorMap {
-        /// The binding for the backing tensor
-        binding: Binding,
-        /// The tensormap metadata
-        map: TensorMapMeta,
-    },
+pub struct TensorMapBinding {
+    /// The binding for the backing tensor
+    pub binding: Binding,
+    /// The tensormap metadata
+    pub map: TensorMapMeta,
 }
 
 /// TensorMap metadata for the opaque proxy used in TMA copies
@@ -197,6 +275,7 @@ pub struct TensorMapMeta {
     /// Strides of the backing tensor
     pub strides: Vec<usize>,
     /// Element stride, usually 1 but may be 2 for complex tensors
+    /// For im2col, this is equivalent to the kernel stride
     pub elem_stride: Vec<usize>,
     /// Interleave mode
     pub interleave: TensorMapInterleave,

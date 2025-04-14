@@ -1,18 +1,17 @@
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
-use cubecl_std::CubeOption;
 
 use crate::matmul::components::{
-    Ident, MatmulConfigFactory, MatmulSize, MatrixLayout, TilingDimensions,
+    Ident, MatmulConfigFactory, MatmulPrecision, MatmulSize, MatrixLayout, TilingDimensions,
     config::MatmulConfig,
-    global::{self, AccumulatorLoader, IndexedQuantization},
+    global::{self, AccumulatorLoader},
     tile::TileConfig,
 };
 
-use super::{StageEventListener, TilingLayout};
+use super::{Reader, StageEventListener, TilingLayout};
 
-pub trait ReaderFamily {
-    type Reader<I: Numeric, T: TilingLayout>: CubeType;
+pub trait ReaderFamily: Send + Sync + 'static {
+    type Reader<ES: Numeric, T: TilingLayout>: Reader<ES>;
 }
 
 pub trait StageMatmulFamily:
@@ -27,14 +26,12 @@ pub trait StageMatmulFamily:
     /// Returns the number of tiles in each axis of the stage.
     fn tile_count(config: &Self::Config) -> MatmulSize;
 
-    type Matmul<I: Numeric, O: Numeric, Acc: Numeric, TL: TilingLayout, TR: TilingLayout>: StageMatmul<
-        I,
-        O,
-        Acc,
-        Config = Self::Config,
-        LhsReader = <Self::LhsReader as ReaderFamily>::Reader<I, TL>,
-        RhsReader = <Self::RhsReader as ReaderFamily>::Reader<I, TR>,
-    >;
+    type Matmul<MP: MatmulPrecision, TL: TilingLayout, TR: TilingLayout>: StageMatmul<
+            MP,
+            Config = Self::Config,
+            LhsReader = <Self::LhsReader as ReaderFamily>::Reader<MP::ES, TL>,
+            RhsReader = <Self::RhsReader as ReaderFamily>::Reader<MP::ES, TR>,
+        >;
 }
 
 #[cube]
@@ -52,7 +49,7 @@ pub trait StageMatmulFamily:
 ///  - Data given as inputs by stage readers must always be valid. If the actual matrix multiplication
 ///    should be done on smaller sizes than M, N and K, padding with zeros must be done beforehand.
 ///  - Enough planes are launched to perform the whole computation
-pub trait StageMatmul<ES: Numeric, EG: Numeric, EA: Numeric>: 'static + Send + Sync {
+pub trait StageMatmul<MP: MatmulPrecision>: 'static + Send + Sync {
     type Config: StageConfig;
 
     /// Contains the matrix multiplication output, that can be shared across the different planes of the cube.
@@ -79,7 +76,6 @@ pub trait StageMatmul<ES: Numeric, EG: Numeric, EA: Numeric>: 'static + Send + S
         instruction_lhs: &mut Self::LhsTile,
         instruction_rhs: &mut Self::RhsTile,
         acc: &mut Self::Accumulator,
-        scaling: CubeOption<f32>,
         #[comptime] config: Self::Config,
     );
 
@@ -91,7 +87,6 @@ pub trait StageMatmul<ES: Numeric, EG: Numeric, EA: Numeric>: 'static + Send + S
         instruction_lhs: &mut Self::LhsTile,
         instruction_rhs: &mut Self::RhsTile,
         acc: &mut Self::Accumulator,
-        scaling: CubeOption<f32>,
         #[comptime] config: Self::Config,
         listener: SEL,
     );
@@ -105,10 +100,9 @@ pub trait StageMatmul<ES: Numeric, EG: Numeric, EA: Numeric>: 'static + Send + S
     /// If some `quantization` is provided, the read will also requantize the stage in the output
     /// and update the scaling of the output tensor. This assumes that [execute] is called
     /// with some `scaling` provided.
-    fn read_accumulator<Out: StageWriter<EG>, G: global::GlobalConfig>(
+    fn read_accumulator<Out: StageWriter<MP::EO>, G: global::GlobalConfig>(
         acc: &Self::Accumulator,
         out: &mut Out,
-        quantization: CubeOption<IndexedQuantization<EG>>,
         #[comptime] stage_config: Self::Config,
         #[comptime] global_config: G,
     );
@@ -120,7 +114,7 @@ pub trait StageMatmul<ES: Numeric, EG: Numeric, EA: Numeric>: 'static + Send + S
     fn zero_accumulator(acc: &mut Self::Accumulator, #[comptime] config: Self::Config);
 
     /// Fill the accumulator with data
-    fn fill_accumulator<L: AccumulatorLoader<EG, EA, Self::Config>>(
+    fn fill_accumulator<L: AccumulatorLoader<MP>>(
         loader: &mut L,
         acc: &mut Self::Accumulator,
         #[comptime] config: Self::Config,
@@ -145,7 +139,7 @@ pub trait StageReader<ES: Numeric>: CubeType {
 #[cube]
 /// Responsible of writing the accumulated stage matmul output
 /// to global memory
-pub trait StageWriter<EG: Numeric>: CubeType + 'static + Send + Sync {
+pub trait StageWriter<EO: Numeric>: CubeType + 'static + Send + Sync {
     /// Writes the given slice to global memory, at a position that depends on
     /// plane and accumulator indexes.
     fn write<ES: Numeric, G: global::GlobalConfig>(
@@ -182,11 +176,16 @@ pub trait StageConfig: MatmulConfig {
 
     fn tile_count(&self) -> &MatmulSize;
 
-    fn buffering(&self) -> Buffering;
+    fn buffering(&self) -> StageBuffering;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Buffering {
+pub enum StageBuffering {
     Single,
     Double,
 }
+
+// TODO Support autotuning the best stage buffering
+//      However, from simple benchmarks on Maxime's computer (NVIDIA GeForce RTX 4060)
+//      Double seems to always be faster or comparable to simple.
+pub const STAGE_BUFFERING: StageBuffering = StageBuffering::Double;

@@ -156,6 +156,10 @@ pub enum Expression {
     Comment {
         content: LitStr,
     },
+    RustMacro {
+        ident: Ident,
+        tokens: TokenStream,
+    },
     Terminate,
 }
 
@@ -209,6 +213,7 @@ impl Expression {
             Expression::CompilerIntrinsic { .. } => None,
             Expression::Match { .. } => None,
             Expression::Comment { .. } => None,
+            Expression::RustMacro { .. } => None,
             Expression::Terminate => None,
         }
     }

@@ -1,11 +1,11 @@
 use std::{sync::Arc, thread};
 
-use cubecl_common::{ExecutionMode, benchmark::TimestampsResult};
+use cubecl_common::{ExecutionMode, benchmark::ProfileDuration};
 
 use super::ComputeChannel;
 use crate::{
     memory_management::MemoryUsage,
-    server::{Binding, BindingWithMeta, ComputeServer, ConstBinding, CubeCount, Handle},
+    server::{Binding, BindingWithMeta, Bindings, ComputeServer, CubeCount, Handle},
     storage::{BindingResource, ComputeStorage},
 };
 
@@ -44,18 +44,13 @@ where
     CreateTensor(Vec<u8>, Vec<usize>, usize, Callback<(Handle, Vec<usize>)>),
     Empty(usize, Callback<Handle>),
     EmptyTensor(Vec<usize>, usize, Callback<(Handle, Vec<usize>)>),
-    ExecuteKernel(
-        (Server::Kernel, CubeCount, ExecutionMode),
-        Vec<ConstBinding>,
-        Vec<Binding>,
-    ),
+    ExecuteKernel((Server::Kernel, CubeCount, ExecutionMode), Bindings),
     Flush,
-    SyncElapsed(Callback<TimestampsResult>),
     Sync(Callback<()>),
     MemoryUsage(Callback<MemoryUsage>),
     MemoryCleanup,
-    EnableTimestamps,
-    DisableTimestamps,
+    StartProfile,
+    StopMeasure(Callback<ProfileDuration>),
 }
 
 impl<Server> MpscComputeChannel<Server>
@@ -100,13 +95,9 @@ where
                             let handle = server.empty_tensor(&shape, elem_size);
                             callback.send(handle).await.unwrap();
                         }
-                        Message::ExecuteKernel(kernel, constants, bindings) => unsafe {
-                            server.execute(kernel.0, kernel.1, constants, bindings, kernel.2);
+                        Message::ExecuteKernel(kernel, bindings) => unsafe {
+                            server.execute(kernel.0, kernel.1, bindings, kernel.2);
                         },
-                        Message::SyncElapsed(callback) => {
-                            let duration = server.sync_elapsed().await;
-                            callback.send(duration).await.unwrap();
-                        }
                         Message::Sync(callback) => {
                             server.sync().await;
                             callback.send(()).await.unwrap();
@@ -120,11 +111,11 @@ where
                         Message::MemoryCleanup => {
                             server.memory_cleanup();
                         }
-                        Message::EnableTimestamps => {
-                            server.enable_timestamps();
+                        Message::StartProfile => {
+                            server.start_profile();
                         }
-                        Message::DisableTimestamps => {
-                            server.disable_timestamps();
+                        Message::StopMeasure(callback) => {
+                            callback.send(server.end_profile()).await.unwrap();
                         }
                     };
                 }
@@ -239,18 +230,13 @@ where
         &self,
         kernel: Server::Kernel,
         count: CubeCount,
-        constants: Vec<ConstBinding>,
-        bindings: Vec<Binding>,
+        bindings: Bindings,
         kind: ExecutionMode,
     ) {
         self.state
             .sender
-            .send_blocking(Message::ExecuteKernel(
-                (kernel, count, kind),
-                constants,
-                bindings,
-            ))
-            .unwrap()
+            .send_blocking(Message::ExecuteKernel((kernel, count, kind), bindings))
+            .unwrap();
     }
 
     fn flush(&self) {
@@ -262,16 +248,6 @@ where
         self.state
             .sender
             .send(Message::Sync(callback))
-            .await
-            .unwrap();
-        handle_response(response.recv().await)
-    }
-
-    async fn sync_elapsed(&self) -> TimestampsResult {
-        let (callback, response) = async_channel::unbounded();
-        self.state
-            .sender
-            .send(Message::SyncElapsed(callback))
             .await
             .unwrap();
         handle_response(response.recv().await)
@@ -293,18 +269,20 @@ where
             .unwrap()
     }
 
-    fn enable_timestamps(&self) {
+    fn start_profile(&self) {
         self.state
             .sender
-            .send_blocking(Message::EnableTimestamps)
+            .send_blocking(Message::StartProfile)
             .unwrap();
     }
 
-    fn disable_timestamps(&self) {
+    fn end_profile(&self) -> ProfileDuration {
+        let (callback, response) = async_channel::unbounded();
         self.state
             .sender
-            .send_blocking(Message::DisableTimestamps)
+            .send_blocking(Message::StopMeasure(callback))
             .unwrap();
+        handle_response(response.recv_blocking())
     }
 }
 

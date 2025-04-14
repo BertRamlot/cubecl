@@ -1,32 +1,24 @@
 use crate::matmul::components::{
-    MatmulPrecision,
+    InputIdent, MatmulPrecision,
     global::{
-        GlobalMatmul, IndexedQuantization, ZeroAccumulatorLoader,
+        GlobalMatmul, Quantization, ZeroAccumulatorLoader,
+        load::{SyncFullLoader, SyncFullLoadingStrategy},
         output_loader::Unloader,
-        single_stage::{
-            Config, FullLoader, SyncFullLhsLoader, SyncFullLoader, SyncFullLoadingStrategy,
-            SyncFullRhsLoader,
-        },
+        single_stage::Config,
     },
-    stage::{
-        StageMatmul,
-        multi_buffer::{LhsReader, RhsReader},
-    },
+    stage::{FullReader, StageMatmul},
 };
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
+use cubecl_std::CubeOption;
 use cubecl_std::tensor::r#virtual::{ReadWrite, VirtualTensor};
-use cubecl_std::{CubeOption, CubeOptionExpand};
 use std::marker::PhantomData;
 
 use crate::matmul::{
     components::{
         Ident, InvalidConfigError, MatmulConfigFactory, MatmulProblem,
         global::{GlobalConfig, GlobalMatmulFamily},
-        stage::{
-            self,
-            multi_buffer::{LhsReaderFamily, RhsReaderFamily},
-        },
+        stage::{self, FullReaderFamily},
     },
     kernels::MatmulAvailabilityError,
 };
@@ -43,16 +35,12 @@ pub struct SimpleMatmulFamily<
 
 impl<SMM, LL, RL> GlobalMatmulFamily for SimpleMatmulFamily<SMM, LL, RL>
 where
-    SMM: stage::StageMatmulFamily<LhsReader = LhsReaderFamily, RhsReader = RhsReaderFamily>,
+    SMM: stage::StageMatmulFamily<LhsReader = FullReaderFamily, RhsReader = FullReaderFamily>,
     LL: SyncFullLoadingStrategy,
     RL: SyncFullLoadingStrategy,
 {
-    type Matmul<MP: MatmulPrecision> = SimpleMatmul<
-        MP,
-        SMM::Matmul<MP::ES, MP::EG, MP::EA, LL::TilingLayout, RL::TilingLayout>,
-        LL,
-        RL,
-    >;
+    type Matmul<MP: MatmulPrecision> =
+        SimpleMatmul<MP, SMM::Matmul<MP, LL::TilingLayout, RL::TilingLayout>, LL, RL>;
 }
 
 impl<SMM, LL, RL> MatmulConfigFactory for SimpleMatmulFamily<SMM, LL, RL>
@@ -107,7 +95,7 @@ where
 /// - All planes are used in the stage matmul computation
 pub struct SimpleMatmul<
     MP: MatmulPrecision,
-    SMM: StageMatmul<MP::ES, MP::EG, MP::EA>,
+    SMM: StageMatmul<MP>,
     LL: SyncFullLoadingStrategy,
     RL: SyncFullLoadingStrategy,
 > {
@@ -121,30 +109,26 @@ pub struct SimpleMatmul<
 impl<MP: MatmulPrecision, SMM, LL, RL> GlobalMatmul<MP> for SimpleMatmul<MP, SMM, LL, RL>
 where
     SMM: StageMatmul<
-            MP::ES,
-            MP::EG,
-            MP::EA,
-            LhsReader = LhsReader<MP::ES, LL::TilingLayout>,
-            RhsReader = RhsReader<MP::ES, RL::TilingLayout>,
+            MP,
+            LhsReader = FullReader<MP::ES, LL::TilingLayout>,
+            RhsReader = FullReader<MP::ES, RL::TilingLayout>,
         >,
     LL: SyncFullLoadingStrategy,
     RL: SyncFullLoadingStrategy,
 {
     type Config = Config<SMM::Config>;
-    type LhsLoader = SyncFullLhsLoader<MP::EG, MP::ES, SMM::Config, LL>;
-    type RhsLoader = SyncFullRhsLoader<MP::EG, MP::ES, SMM::Config, RL>;
+    type LhsLoader = SyncFullLoader<MP, SMM::Config, LL>;
+    type RhsLoader = SyncFullLoader<MP, SMM::Config, RL>;
     type AccumulatorLoader = ZeroAccumulatorLoader;
-    type Out = Unloader<MP::EG>;
+    type Out = Unloader<MP::EO>;
     type Accumulator = SMM::Accumulator;
 
-    #[allow(clippy::clone_on_copy, clippy::manual_map, clippy::single_match)]
     fn execute(
         mut lhs_loader: Self::LhsLoader,
         mut rhs_loader: Self::RhsLoader,
         mut out_unloader: Self::Out,
         acc: &mut Self::Accumulator,
         k_range: (u32, u32),
-        quantization: CubeOption<IndexedQuantization<MP::EG>>,
         #[comptime] config: Self::Config,
     ) {
         let k_step = config.k_step;
@@ -165,66 +149,69 @@ where
 
             sync_units();
 
-            let scaling = match quantization.clone() {
-                CubeOption::Some(quantization) => CubeOption::new_Some(
-                    quantization.read_current_scale_lhs(config.global_line_size(Ident::Lhs))
-                        * quantization.read_current_scale_rhs(config.global_line_size(Ident::Rhs)),
-                ),
-                CubeOption::None => CubeOption::new_None(),
-            };
-
             SMM::execute(
                 lhs_stage_reader,
                 rhs_stage_reader,
                 &mut lhs_tile,
                 &mut rhs_tile,
                 acc,
-                scaling,
                 config.to_smm_config(),
             );
 
             Self::LhsLoader::advance_view(&mut lhs_loader, k_step);
             Self::RhsLoader::advance_view(&mut rhs_loader, k_step);
-
-            match quantization.clone() {
-                CubeOption::Some(mut quantization) => quantization.advance_indices(),
-                CubeOption::None => {}
-            }
         }
 
         SMM::read_accumulator::<Self::Out, Self::Config>(
             acc,
             &mut out_unloader,
-            quantization,
             config.to_smm_config(),
             config,
         );
     }
 
     fn init_lhs_loader(
-        lhs: VirtualTensor<MP::EG>,
+        lhs: VirtualTensor<MP::EI>,
         x_offset: u32,
         y_offset: u32,
         _nth_batch: u32,
         batch_offset: u32,
+        quantization: CubeOption<Quantization<MP>>,
         #[comptime] config: Self::Config,
     ) -> Self::LhsLoader {
-        Self::LhsLoader::new::<Self::Config>(lhs, x_offset, y_offset, batch_offset, config)
+        Self::LhsLoader::new::<Self::Config>(
+            lhs,
+            x_offset,
+            y_offset,
+            batch_offset,
+            quantization,
+            InputIdent::Lhs,
+            config,
+        )
     }
 
     fn init_rhs_loader(
-        rhs: VirtualTensor<MP::EG>,
+        rhs: VirtualTensor<MP::EI>,
         x_offset: u32,
         y_offset: u32,
         _nth_batch: u32,
         batch_offset: u32,
+        quantization: CubeOption<Quantization<MP>>,
         #[comptime] config: Self::Config,
     ) -> Self::RhsLoader {
-        Self::RhsLoader::new::<Self::Config>(rhs, x_offset, y_offset, batch_offset, config)
+        Self::RhsLoader::new::<Self::Config>(
+            rhs,
+            x_offset,
+            y_offset,
+            batch_offset,
+            quantization,
+            InputIdent::Rhs,
+            config,
+        )
     }
 
     fn init_unloader(
-        out: VirtualTensor<MP::EG, ReadWrite>,
+        out: VirtualTensor<MP::EO, ReadWrite>,
         x_offset: u32,
         y_offset: u32,
         _nth_batch: u32,

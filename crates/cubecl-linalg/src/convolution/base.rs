@@ -1,37 +1,44 @@
 use crate::matmul::{
     components::{
-        InvalidConfigError, MatmulPrecision, MatmulProblem, MatrixLayout,
+        InputRuntimeArg, InvalidConfigError, MatmulPrecision, MatmulProblem, MatmulSpec,
+        MatrixLayout, OutputRuntimeArg,
         global::{AccumulatorLoader, OutputLoader},
-        stage::{StageMatmul, StageMatmulFamily},
     },
     kernels::MatmulAvailabilityError,
 };
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
-use cubecl_std::tensor::r#virtual::{ReadWrite, VirtualTensor};
+use cubecl_std::{
+    CubeOption, FastDivmod,
+    tensor::r#virtual::{ReadWrite, VirtualTensor},
+};
 
-use super::{ConvGemmConfig, homogeneous::base::ConvTilingLayout};
+use super::ConvGemmConfig;
 
-pub trait ConvolutionFamily<SMM: StageMatmulFamily>:
+#[derive(CubeType, CubeLaunch, Clone)]
+pub struct RuntimeArgs {
+    pub size_m: u32,
+    pub size_n: u32,
+    pub size_k: u32,
+    pub padded_channels: FastDivmod,
+    pub out_h: FastDivmod,
+    pub out_w: FastDivmod,
+}
+
+pub trait ConvolutionFamily:
     ConvolutionConfigFactory<Config: ConvGemmConfig> + ConvolutionLaunch
 {
-    type Convolution<CS: MatmulPrecision>: Convolution<
-            CS,
-            SMM::Matmul<CS::ES, CS::EG, CS::EA, ConvTilingLayout, ConvTilingLayout>,
-            Config = Self::Config,
-        >;
+    type Convolution<MP: MatmulPrecision>: Convolution<MP, Config = Self::Config>;
 }
 
 #[cube]
-pub trait Convolution<CS: MatmulPrecision, SMM: StageMatmul<CS::ES, CS::EG, CS::EA>>:
-    'static + Send + Sync
-{
+pub trait Convolution<MP: MatmulPrecision>: 'static + Send + Sync {
     type LhsLoader: CubeType;
     type RhsLoader: CubeType;
     type Config: ConvGemmConfig;
-    type AccumulatorLoader: AccumulatorLoader<CS::EG, CS::EA, SMM::Config>;
+    type AccumulatorLoader: AccumulatorLoader<MP>;
 
-    type Out: OutputLoader<CS::EG>;
+    type Out: OutputLoader<MP::EO>;
     type Accumulator: CubeType;
 
     /// Performs the convolution over data loaded by the
@@ -51,28 +58,29 @@ pub trait Convolution<CS: MatmulPrecision, SMM: StageMatmul<CS::ES, CS::EG, CS::
     );
 
     fn init_lhs_loader(
-        lhs: VirtualTensor<CS::EG>,
+        lhs: VirtualTensor<MP::EI>,
         x_offset: u32,
         y_offset: u32,
+        runtime_args: &RuntimeArgs,
         #[comptime] config: Self::Config,
     ) -> Self::LhsLoader;
 
     fn init_rhs_loader(
-        rhs: VirtualTensor<CS::EG>,
+        rhs: VirtualTensor<MP::EI>,
         x_offset: u32,
         y_offset: u32,
+        runtime_args: &RuntimeArgs,
         #[comptime] config: Self::Config,
     ) -> Self::RhsLoader;
 
     fn init_bias_loader(
-        bias: VirtualTensor<CS::EG>,
+        bias: CubeOption<VirtualTensor<MP::EO>>,
         n_offset: u32,
         #[comptime] config: Self::Config,
-        #[comptime] has_bias: bool,
     ) -> Self::AccumulatorLoader;
 
     fn init_unloader(
-        out: VirtualTensor<CS::EG, ReadWrite>,
+        out: VirtualTensor<MP::EO, ReadWrite>,
         x_offset: u32,
         y_offset: u32,
     ) -> Self::Out;
@@ -96,7 +104,7 @@ pub trait ConvolutionConfigFactory: Send + Sync + 'static {
         cube_count: &CubeCount,
     ) -> Self::Config;
 
-    fn check_availability<R: Runtime, CS: MatmulPrecision>(
+    fn check_availability<R: Runtime, MP: MatmulPrecision>(
         client: &ComputeClient<R::Server, R::Channel>,
         config: &Self::Config,
     ) -> Result<(), MatmulAvailabilityError>;
@@ -110,19 +118,19 @@ pub trait ConvolutionLaunch: ConvolutionConfigFactory {
     ///
     /// Out-of-bounds can happen
     #[allow(clippy::too_many_arguments)]
-    unsafe fn launch_unchecked<CS: MatmulPrecision, R: Runtime>(
+    unsafe fn launch_unchecked<'a, MS: MatmulSpec, R: Runtime>(
         client: &ComputeClient<<R as Runtime>::Server, <R as Runtime>::Channel>,
         cube_dim: CubeDim,
         cube_count: CubeCount,
-        input: TensorArg<'_, R>,
-        weight: TensorArg<'_, R>,
-        bias: TensorArg<'_, R>,
-        out: TensorArg<'_, R>,
+        input: InputRuntimeArg<'a, MS, R>,
+        bias: Option<TensorArg<'a, R>>,
+        output: OutputRuntimeArg<'a, MS, R>,
+        problem: &ConvolutionProblem,
         config: <Self as ConvolutionConfigFactory>::Config,
     );
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 /// Description of a matmul problem to solve, regardless of actual data
 pub struct ConvolutionProblem {
     pub m: usize,
@@ -138,9 +146,14 @@ pub struct ConvolutionProblem {
     pub stride: (u32, u32),
     pub padding: (i32, i32),
     pub dilation: (u32, u32),
-    pub out_shape_y: usize,
-    pub out_shape_x: usize,
-    pub has_bias: bool,
+
+    pub batches: usize,
+    pub height: usize,
+    pub width: usize,
+    pub channels: usize,
+
+    pub out_h: usize,
+    pub out_w: usize,
 }
 
 impl ConvolutionProblem {

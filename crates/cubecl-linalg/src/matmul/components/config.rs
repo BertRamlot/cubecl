@@ -74,7 +74,7 @@ pub enum Ident {
 }
 
 impl Ident {
-    pub fn as_input(&self) -> InputIdent {
+    pub fn as_input_ident(&self) -> InputIdent {
         match self {
             Ident::Lhs => InputIdent::Lhs,
             Ident::Rhs => InputIdent::Rhs,
@@ -83,9 +83,28 @@ impl Ident {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+/// Identifier for the two input tensors in a matmul.
+///
+/// Useful to specialize some functions depending on the tensor
 pub enum InputIdent {
     Lhs,
     Rhs,
+}
+
+impl InputIdent {
+    pub fn as_ident(&self) -> Ident {
+        match self {
+            InputIdent::Lhs => Ident::Lhs,
+            InputIdent::Rhs => Ident::Rhs,
+        }
+    }
+}
+
+impl From<InputIdent> for Ident {
+    fn from(value: InputIdent) -> Self {
+        value.as_ident()
+    }
 }
 
 #[derive(CubeType, Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -199,4 +218,29 @@ impl TilingDimensions {
     pub fn tile_count_col(&self) -> u32 {
         self.tile_count_col
     }
+}
+
+pub trait TensorIdent:
+    Clone + Copy + Debug + Hash + PartialEq + Eq + Send + Sync + 'static
+{
+    const IDENT: Ident;
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct Lhs;
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct Rhs;
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct Out;
+
+impl TensorIdent for Lhs {
+    const IDENT: Ident = Ident::Lhs;
+}
+
+impl TensorIdent for Rhs {
+    const IDENT: Ident = Ident::Rhs;
+}
+
+impl TensorIdent for Out {
+    const IDENT: Ident = Ident::Out;
 }

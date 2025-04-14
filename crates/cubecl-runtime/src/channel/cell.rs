@@ -1,9 +1,10 @@
 use super::ComputeChannel;
-use crate::server::{Binding, BindingWithMeta, ComputeServer, ConstBinding, CubeCount, Handle};
+use crate::server::{Binding, BindingWithMeta, Bindings, ComputeServer, CubeCount, Handle};
 use crate::storage::{BindingResource, ComputeStorage};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use cubecl_common::{ExecutionMode, benchmark::TimestampsResult};
+use cubecl_common::ExecutionMode;
+use cubecl_common::benchmark::ProfileDuration;
 
 /// A channel using a [ref cell](core::cell::RefCell) to access the server with mutability.
 ///
@@ -93,14 +94,13 @@ where
         &self,
         kernel_description: Server::Kernel,
         count: CubeCount,
-        constants: Vec<ConstBinding>,
-        bindings: Vec<Binding>,
+        bindings: Bindings,
         kind: ExecutionMode,
     ) {
         unsafe {
             self.server
                 .borrow_mut()
-                .execute(kernel_description, count, constants, bindings, kind)
+                .execute(kernel_description, count, bindings, kind)
         }
     }
 
@@ -116,14 +116,6 @@ where
         future.await
     }
 
-    async fn sync_elapsed(&self) -> TimestampsResult {
-        let future = {
-            let mut server = self.server.borrow_mut();
-            server.sync_elapsed()
-        };
-        future.await
-    }
-
     fn memory_usage(&self) -> crate::memory_management::MemoryUsage {
         self.server.borrow_mut().memory_usage()
     }
@@ -132,12 +124,12 @@ where
         self.server.borrow_mut().memory_cleanup();
     }
 
-    fn enable_timestamps(&self) {
-        self.server.borrow_mut().enable_timestamps();
+    fn start_profile(&self) {
+        self.server.borrow_mut().start_profile()
     }
 
-    fn disable_timestamps(&self) {
-        self.server.borrow_mut().disable_timestamps();
+    fn end_profile(&self) -> ProfileDuration {
+        self.server.borrow_mut().end_profile()
     }
 }
 

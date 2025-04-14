@@ -10,6 +10,9 @@ use std::{
     marker::PhantomData,
 };
 
+pub(crate) const INFO_NAME: &str = "info";
+pub(crate) const STATIC_INFO_NAME: &str = "static_info";
+
 #[derive(Debug, Clone)]
 pub struct BinaryInstruction<D: Dialect> {
     pub lhs: Variable<D>,
@@ -27,11 +30,14 @@ pub struct UnaryInstruction<D: Dialect> {
 pub enum Instruction<D: Dialect> {
     Metadata {
         info_offset: Variable<D>,
+        split_meta: bool,
         out: Variable<D>,
     },
     ExtendedMetadata {
         info_offset: Variable<D>,
         dim: Variable<D>,
+        split_meta: bool,
+        static_offset: u32,
         out: Variable<D>,
     },
     ConstLength {
@@ -57,6 +63,7 @@ pub enum Instruction<D: Dialect> {
     Div(BinaryInstruction<D>),
     Mul(BinaryInstruction<D>),
     Sub(BinaryInstruction<D>),
+    HiMul(BinaryInstruction<D>),
     Index(BinaryInstruction<D>),
     IndexAssign(BinaryInstruction<D>),
     Assign(UnaryInstruction<D>),
@@ -107,6 +114,11 @@ pub enum Instruction<D: Dialect> {
         end: Variable<D>,
         out: Variable<D>,
         len: Variable<D>,
+    },
+    ReinterpretSlice {
+        input: Variable<D>,
+        line_size: u32,
+        out: Variable<D>,
     },
     Return,
     Break,
@@ -236,8 +248,9 @@ impl<D: Dialect> Display for Instruction<D> {
                 out,
             } => {
                 let item = out.item();
+                let addr_space = D::address_space_for_variable(input);
                 writeln!(f, "const uint {out}_length = {end} - {start};")?;
-                writeln!(f, "{item} *{out} = {input} + {start};")
+                writeln!(f, "{addr_space}{item} *{out} = {input} + {start};")
             }
             Instruction::CheckedSlice {
                 input,
@@ -247,12 +260,28 @@ impl<D: Dialect> Display for Instruction<D> {
                 len,
             } => {
                 let item = out.item();
+                let addr_space = D::address_space_for_variable(input);
                 writeln!(f, "const uint {out}_length = min({len}, {end}) - {start};")?;
-                writeln!(f, "{item} *{out} = {input} + {start};")
+                writeln!(f, "{addr_space}{item} *{out} = {input} + {start};")
+            }
+            Instruction::ReinterpretSlice {
+                input,
+                line_size,
+                out,
+            } => {
+                let mut item = out.item();
+                item.vectorization = *line_size as usize;
+                let addr_space = D::address_space_for_variable(input);
+
+                writeln!(
+                    f,
+                    "{addr_space}{item} *{out} = reinterpret_cast<{item}*>({input});"
+                )
             }
             Instruction::Mul(it) => Mul::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::Div(it) => Div::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::Sub(it) => Sub::format(f, &it.lhs, &it.rhs, &it.out),
+            Instruction::HiMul(it) => HiMul::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::Modulo(inst) => Modulo::format(f, &inst.lhs, &inst.rhs, &inst.out),
             Instruction::BitwiseOr(it) => BitwiseOr::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::BitwiseAnd(it) => BitwiseAnd::format(f, &it.lhs, &it.rhs, &it.out),
@@ -409,17 +438,35 @@ for ({i_ty} {i} = {start}; {i} {cmp} {end}; {increment}) {{
                 }
                 f.write_str("}\n}\n")
             }
-            Instruction::Metadata { info_offset, out } => {
+            Instruction::Metadata {
+                info_offset,
+                split_meta,
+                out,
+            } => {
                 let out = out.fmt_left();
-                writeln!(f, "{out} = info[{info_offset}];")
+                match *split_meta {
+                    true => writeln!(f, "{out} = static_info.x[{info_offset}];"),
+                    false => writeln!(f, "{out} = {INFO_NAME}[{info_offset}];"),
+                }
             }
             Instruction::ExtendedMetadata {
                 info_offset,
                 dim,
+                split_meta,
+                static_offset,
                 out,
             } => {
                 let out = out.fmt_left();
-                writeln!(f, "{out} = info[info[{info_offset}] + {dim}];")
+                match *split_meta {
+                    true => writeln!(
+                        f,
+                        "{out} = {INFO_NAME}[{STATIC_INFO_NAME}.x[{info_offset}] + {dim} - {static_offset}];"
+                    ),
+                    false => writeln!(
+                        f,
+                        "{out} = {INFO_NAME}[{INFO_NAME}[{info_offset}] + {dim}];"
+                    ),
+                }
             }
             Instruction::Equal(it) => Equal::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::NotEqual(it) => NotEqual::format(f, &it.lhs, &it.rhs, &it.out),
@@ -449,7 +496,7 @@ for ({i_ty} {i} = {start}; {i} {cmp} {end}; {increment}) {{
                 max_value,
                 out,
             } => Clamp::format(f, input, min_value, max_value, out),
-            Instruction::SyncThreads => f.write_str("__syncthreads();\n"),
+            Instruction::SyncThreads => D::compile_instruction_sync_threads(f),
             Instruction::ThreadFence => f.write_str("__threadfence();\n"),
             Instruction::Round(it) => Round::format(f, &it.input, &it.out),
             Instruction::Ceil(it) => Ceil::format(f, &it.input, &it.out),
@@ -467,123 +514,57 @@ for ({i_ty} {i} = {start}; {i} {cmp} {end}; {increment}) {{
             Instruction::Wmma(it) => write!(f, "{it}"),
             Instruction::Bitcast(UnaryInstruction { input, out }) => {
                 let qualifier = out.const_qualifier();
-                let out_elem = out.elem();
-                let out = out.fmt_left();
+                let input_item = input.item();
+                let out_item = out.item();
 
-                match (input.elem(), out_elem) {
-                    (Elem::F32, Elem::I32) => {
-                        writeln!(f, "{out} = __float_as_int({input});")
-                    }
-                    (Elem::F32, Elem::U32) => {
-                        writeln!(f, "{out} = __float_as_uint({input});")
-                    }
-                    (Elem::F16, Elem::I32) => {
-                        writeln!(f, "{out} = __half_as_short({input});")
-                    }
-                    (Elem::F16, Elem::U32) => {
-                        writeln!(f, "{out} = __half_as_ushort({input});")
-                    }
-                    (Elem::BF16, Elem::I32) => {
-                        writeln!(f, "{out} = __bfloat16_as_short({input});")
-                    }
-                    (Elem::BF16, Elem::U32) => {
-                        writeln!(f, "{out} = __bfloat16_as_ushort({input});")
-                    }
-                    (Elem::I32, Elem::F32) => {
-                        writeln!(f, "{out} = __int_as_float({input});")
-                    }
-                    (Elem::I32, Elem::F16) => {
-                        writeln!(f, "{out} = __short_as_half({input});")
-                    }
-                    (Elem::I32, Elem::BF16) => {
-                        writeln!(f, "{out} = __short_as_bfloat16({input});")
-                    }
-                    (Elem::U32, Elem::F32) => {
-                        writeln!(f, "{out} = __uint_as_float({input});")
-                    }
-                    (Elem::U32, Elem::F16) => {
-                        writeln!(f, "{out} = __ushort_as_half({input});")
-                    }
-                    (Elem::U32, Elem::BF16) => {
-                        writeln!(f, "{out} = __ushort_as_bfloat16({input});")
-                    }
-                    (Elem::I32, Elem::U32) => {
-                        writeln!(f, "{out} = reinterpret_cast<uint{qualifier}&>({input});")
-                    }
-                    elem => panic!("Unsupported type for bitcasting {elem:?}"),
+                if out_item.elem.size() * out_item.vectorization
+                    != input.item().elem.size() * input.item().vectorization
+                {
+                    panic!("Unsupported type for bitcasting {out_item:?} from {input_item:?}");
+                } else {
+                    let out = out.fmt_left();
+                    let addr_space = D::address_space_for_variable(input);
+                    writeln!(
+                        f,
+                        "{out} = reinterpret_cast<{addr_space}{out_item}{qualifier}&>({input});"
+                    )
                 }
+            }
+            Instruction::AtomicAdd(BinaryInstruction { lhs, rhs, out }) => {
+                D::compile_atomic_add(f, lhs, rhs, out)
+            }
+            Instruction::AtomicAnd(BinaryInstruction { lhs, rhs, out }) => {
+                D::compile_atomic_and(f, lhs, rhs, out)
             }
             Instruction::AtomicCAS {
                 input,
                 cmp,
                 val,
                 out,
-            } => {
-                let out = out.fmt_left();
-                writeln!(f, "{out} = atomicCAS({input}, {cmp}, {val});")
-            }
-            Instruction::AtomicSwap(BinaryInstruction { lhs, rhs, out }) => {
-                let out = out.fmt_left();
-                writeln!(f, "{out} = atomicExch({lhs}, {rhs});")
-            }
-            Instruction::AtomicAdd(BinaryInstruction { lhs, rhs, out }) => {
-                let out = out.fmt_left();
-                match rhs.elem() {
-                    Elem::I64 => {
-                        writeln!(
-                            f,
-                            "{out} = atomicAdd(reinterpret_cast<{uint}*>({lhs}), {uint}({rhs}));",
-                            uint = Elem::<D>::U64
-                        )
-                    }
-                    _ => writeln!(f, "{out} = atomicAdd({lhs}, {rhs});"),
-                }
-            }
-            Instruction::AtomicSub(BinaryInstruction { lhs, rhs, out }) => {
-                let out = out.fmt_left();
-                match rhs.elem() {
-                    Elem::U32 | Elem::I32 => {
-                        writeln!(f, "{out} = atomicSub({lhs}, {rhs});")
-                    }
-                    Elem::U64 => {
-                        writeln!(f, "{out} = atomicAdd({lhs}, -{rhs});",)
-                    }
-                    Elem::I64 => {
-                        writeln!(
-                            f,
-                            "{out} = atomicAdd(reinterpret_cast<{uint}*>({lhs}), {uint}(-{rhs}));",
-                            uint = Elem::<D>::U64
-                        )
-                    }
-                    _ => writeln!(f, "{out} = atomicAdd({lhs}, -{rhs});"),
-                }
+            } => D::compile_atomic_cas(f, input, cmp, val, out),
+            Instruction::AtomicLoad(UnaryInstruction { input, out }) => {
+                D::compile_atomic_load(f, input, out)
             }
             Instruction::AtomicMax(BinaryInstruction { lhs, rhs, out }) => {
-                let out = out.fmt_left();
-                writeln!(f, "{out} = atomicMax({lhs}, {rhs});")
+                D::compile_atomic_max(f, lhs, rhs, out)
             }
             Instruction::AtomicMin(BinaryInstruction { lhs, rhs, out }) => {
-                let out = out.fmt_left();
-                writeln!(f, "{out} = atomicMin({lhs}, {rhs});")
-            }
-            Instruction::AtomicAnd(BinaryInstruction { lhs, rhs, out }) => {
-                let out = out.fmt_left();
-                writeln!(f, "{out} = atomicAnd({lhs}, {rhs});")
+                D::compile_atomic_min(f, lhs, rhs, out)
             }
             Instruction::AtomicOr(BinaryInstruction { lhs, rhs, out }) => {
-                let out = out.fmt_left();
-                writeln!(f, "{out} = atomicOr({lhs}, {rhs});")
-            }
-            Instruction::AtomicXor(BinaryInstruction { lhs, rhs, out }) => {
-                let out = out.fmt_left();
-                writeln!(f, "{out} = atomicXor({lhs}, {rhs});")
-            }
-            Instruction::AtomicLoad(UnaryInstruction { input, out }) => {
-                let out = out.fmt_left();
-                writeln!(f, "{out} = atomicAdd({input}, 0);")
+                D::compile_atomic_or(f, lhs, rhs, out)
             }
             Instruction::AtomicStore(UnaryInstruction { input, out }) => {
-                writeln!(f, "atomicExch({out}, {input});")
+                D::compile_atomic_store(f, input, out)
+            }
+            Instruction::AtomicSub(BinaryInstruction { lhs, rhs, out }) => {
+                D::compile_atomic_sub(f, lhs, rhs, out)
+            }
+            Instruction::AtomicSwap(BinaryInstruction { lhs, rhs, out }) => {
+                D::compile_atomic_swap(f, lhs, rhs, out)
+            }
+            Instruction::AtomicXor(BinaryInstruction { lhs, rhs, out }) => {
+                D::compile_atomic_xor(f, lhs, rhs, out)
             }
             Instruction::Remainder(inst) => Remainder::format(f, &inst.lhs, &inst.rhs, &inst.out),
             Instruction::Neg(UnaryInstruction { input, out }) => {
@@ -605,15 +586,7 @@ for ({i_ty} {i} = {start}; {i} {cmp} {end}; {increment}) {{
             Instruction::Printf {
                 format_string,
                 args,
-            } => {
-                let format_string = escape_string(format_string);
-                let args = args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>();
-                let args = match args.is_empty() {
-                    true => "".to_string(),
-                    false => format!(", {}", args.join(",")),
-                };
-                writeln!(f, "printf(\"{format_string}\"{args});")
-            }
+            } => D::compile_instruction_printf(f, format_string, args),
             Instruction::Comment { content } => {
                 if content.contains('\n') {
                     writeln!(f, "/* {content} */")
@@ -648,24 +621,18 @@ for ({i_ty} {i} = {start}; {i} {cmp} {end}; {increment}) {{
                 indices,
             } => {
                 let rank = indices.len();
+                let smem_ptr = smem_buffer.fmt_ptr();
                 let indices = indices.iter().rev().fold(String::new(), |mut s, it| {
                     let _ = write!(s, "{it}, ");
                     s
                 });
                 writeln!(
                     f,
-                    "cuda::device::experimental::cp_async_bulk_tensor_{rank}d_shared_to_global(&{tensor_map}, {indices} &{smem_buffer});"
+                    "cuda::device::experimental::cp_async_bulk_tensor_{rank}d_shared_to_global(&{tensor_map}, {indices} {smem_ptr});"
                 )
             }
         }
     }
-}
-
-fn escape_string(format_string: &str) -> String {
-    format_string
-        .replace("\t", "\\t")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
 }
 
 struct Fma<D: Dialect> {
@@ -726,14 +693,15 @@ impl<D: Dialect> Clamp<D> {
             _ => ("min", "max"),
         };
 
-        let out = out.fmt_left();
+        let out_fmt = out.fmt_left();
         if num == 1 {
-            writeln!(
-                f,
-                "{out} = {max}({min_value}, {min}({max_value}, {input}));"
-            )
+            writeln!(f, "{out_fmt} = ")?;
+            D::compile_instruction_max_function_name(f, out.item())?;
+            writeln!(f, "({min_value}, ")?;
+            D::compile_instruction_min_function_name(f, out.item())?;
+            writeln!(f, "({max_value}, {input}));")
         } else {
-            writeln!(f, "{out} = {out_item}{{")?;
+            writeln!(f, "{out_fmt} = {out_item}{{")?;
             for i in 0..num {
                 let inputi = input.index(i);
                 let mini = min_value.index(i);
@@ -758,10 +726,13 @@ impl<D: Dialect> Remainder<D> {
         rhs: &Variable<D>,
         out: &Variable<D>,
     ) -> core::fmt::Result {
-        let floor = |elem| match elem {
-            Elem::F16 | Elem::BF16 => "hfloor",
-            Elem::F162 | Elem::BF162 => "h2floor",
-            _ => "floor",
+        let floor = |elem| {
+            let prefix = match elem {
+                Elem::F16 | Elem::BF16 => D::compile_instruction_half_function_name_prefix(),
+                Elem::F162 | Elem::BF162 => D::compile_instruction_half2_function_name_prefix(),
+                _ => "",
+            };
+            format!("{prefix}floor")
         };
 
         if out.item().vectorization == 1 {
@@ -806,12 +777,13 @@ impl<D: Dialect> Remainder<D> {
 
             write_op(&lhs, &rhs, &out_tmp, item_out_optimized)?;
 
+            let addr_space = D::address_space_for_variable(&out_tmp);
             let qualifier = out.const_qualifier();
             let out = out.fmt_left();
 
             writeln!(
                 f,
-                "{out} = reinterpret_cast<{item_out_original}{qualifier}&>({out_tmp});\n"
+                "{out} = reinterpret_cast<{addr_space}{item_out_original}{qualifier}&>({out_tmp});\n"
             )?;
 
             Ok(())

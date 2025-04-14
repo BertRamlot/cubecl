@@ -1,6 +1,9 @@
+use cubecl_core::benchmark::ProfileDuration;
 use cubecl_cpp::{
     CudaCompiler, cuda::arch::CudaArchitecture, formatter::format_cpp, shared::CompilationOptions,
 };
+
+use cubecl_runtime::kernel_timestamps::KernelTimestamps;
 use serde::{Deserialize, Serialize};
 
 use super::fence::{Fence, SyncStream};
@@ -9,7 +12,7 @@ use super::{CudaResource, uninit_vec};
 use cubecl_core::{
     Feature,
     ir::FloatKind,
-    server::{BindingWithMeta, Handle},
+    server::{BindingWithMeta, Bindings, Handle, TensorMapBinding},
 };
 use cubecl_core::{KernelId, prelude::*};
 use cubecl_core::{
@@ -18,7 +21,6 @@ use cubecl_core::{
 };
 use cubecl_runtime::memory_management::MemoryUsage;
 use cubecl_runtime::storage::BindingResource;
-use cubecl_runtime::{TimestampsError, TimestampsResult};
 use cubecl_runtime::{
     debug::{DebugLogger, ProfileLevel},
     storage::ComputeStorage,
@@ -35,7 +37,6 @@ use cudarc::driver::sys::{CUfunc_st, CUtensorMapInterleave};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::time::Instant;
 use std::{ffi::CStr, os::raw::c_void};
 use std::{ffi::CString, mem::MaybeUninit};
 
@@ -65,36 +66,13 @@ pub(crate) struct CudaContext {
 pub struct PtxCacheEntry {
     entrypoint_name: String,
     cube_dim: (u32, u32, u32),
-    shared_mem_bytes: usize,
+    cluster_dim: Option<(u32, u32, u32)>,
     ptx: Vec<i8>,
-}
-
-#[derive(Debug)]
-enum KernelTimestamps {
-    Inferred { start_time: Instant },
-    Disabled,
-}
-
-impl KernelTimestamps {
-    fn enable(&mut self) {
-        if !matches!(self, Self::Disabled) {
-            return;
-        }
-
-        *self = Self::Inferred {
-            start_time: Instant::now(),
-        };
-    }
-
-    fn disable(&mut self) {
-        *self = Self::Disabled;
-    }
 }
 
 #[derive(Debug)]
 struct CompiledKernel {
     cube_dim: CubeDim,
-    shared_mem_bytes: usize,
     func: *mut CUfunc_st,
 }
 
@@ -337,8 +315,7 @@ impl ComputeServer for CudaServer {
         &mut self,
         kernel: Self::Kernel,
         count: CubeCount,
-        constants: Vec<server::ConstBinding>,
-        bindings: Vec<server::Binding>,
+        bindings: Bindings,
         mode: ExecutionMode,
     ) {
         let mut kernel_id = kernel.id();
@@ -367,118 +344,169 @@ impl ComputeServer for CudaServer {
             }
         };
 
+        let (scalars, scalar_bindings) = if self.ctx.compilation_options.grid_constants {
+            let mut scalars = Vec::with_capacity(bindings.scalars.len() + 1);
+            // We need to sort by largest first to have proper packed alignment. Assumes device
+            // pointers are 64-bit aligned, which I believe is true on all cards that support grid
+            // constants regardless. Metadata is inserted after the 8-aligned scalars to ensure proper
+            // packing
+            for binding in bindings.scalars.values().filter(|it| it.elem.size() == 8) {
+                scalars.push(binding.data.as_ptr() as *const _ as *mut c_void);
+            }
+            if bindings.metadata.static_len > 0 {
+                scalars.push(bindings.metadata.data.as_ptr() as *const _ as *mut c_void);
+            }
+            for size in [4, 2, 1] {
+                for binding in bindings
+                    .scalars
+                    .values()
+                    .filter(|it| it.elem.size() == size)
+                {
+                    scalars.push(binding.data.as_ptr() as *const _ as *mut c_void);
+                }
+            }
+
+            let mut handles = Vec::new();
+            if bindings.metadata.static_len > 0 {
+                let dyn_meta = &bindings.metadata.data[bindings.metadata.static_len..];
+                handles.push(self.create(bytemuck::cast_slice(dyn_meta)));
+            }
+
+            (scalars, handles)
+        } else {
+            let mut handles = Vec::new();
+            if !bindings.metadata.data.is_empty() {
+                handles.push(self.create(bytemuck::cast_slice(&bindings.metadata.data)))
+            }
+            handles.extend(
+                bindings
+                    .scalars
+                    .values()
+                    .map(|scalar| self.create(scalar.data())),
+            );
+            (Vec::new(), handles)
+        };
+
         let (ctx, logger) = self.get_context_with_logger();
 
         if !ctx.module_names.contains_key(&kernel_id) {
             ctx.compile_kernel(&kernel_id, kernel, logger, mode);
         }
 
-        let tensor_maps: Vec<_> = constants
+        let tensor_maps: Vec<_> = bindings
+            .tensor_maps
             .into_iter()
-            .map(|it| match it {
-                server::ConstBinding::TensorMap { binding, map } => {
-                    let resource = ctx
-                        .memory_management
-                        .get_resource(
-                            binding.memory.clone(),
-                            binding.offset_start,
-                            binding.offset_end,
+            .map(|TensorMapBinding { map, binding }| {
+                let resource = ctx
+                    .memory_management
+                    .get_resource(
+                        binding.memory.clone(),
+                        binding.offset_start,
+                        binding.offset_end,
+                    )
+                    .expect("Failed to find resource");
+                let device_ptr = resource.ptr as *mut c_void;
+                debug_assert!(
+                    device_ptr as usize % 16 == 0,
+                    "Tensor pointer must be 16 byte aligned"
+                );
+                let lib = unsafe { cudarc::driver::sys::lib() };
+                let mut map_ptr = MaybeUninit::zeroed();
+
+                let shape: Vec<_> = map.shape.iter().rev().map(|s| *s as u64).collect();
+                let strides: Vec<_> = map
+                    .strides
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .map(|s| *s as u64 * map.elem.size() as u64)
+                    .collect();
+                let elem_stride: Vec<_> = map.elem_stride.iter().rev().map(|s| *s as u32).collect();
+
+                debug_assert!(
+                    strides.iter().all(|it| it % 16 == 0),
+                    "Strides must be 16 byte aligned"
+                );
+
+                match &map.format {
+                    TensorMapFormat::Tiled { tile_size } => unsafe {
+                        debug_assert_eq!(tile_size.len(), map.rank, "Tile shape should match rank");
+                        let tile_size: Vec<_> = tile_size.iter().rev().copied().collect();
+
+                        lib.cuTensorMapEncodeTiled(
+                            map_ptr.as_mut_ptr(),
+                            elem_to_tensor_map_type(map.elem),
+                            map.rank as u32,
+                            device_ptr,
+                            shape.as_ptr(),
+                            strides.as_ptr(),
+                            tile_size.as_ptr(),
+                            elem_stride.as_ptr(),
+                            interleave_to_cuda(map.interleave),
+                            swizzle_to_cuda(map.swizzle),
+                            prefetch_to_cuda(map.prefetch),
+                            oob_to_cuda(map.oob_fill),
                         )
-                        .expect("Failed to find resource");
-                    let device_ptr = resource.ptr as *mut c_void;
-                    assert!(
-                        device_ptr as usize % 16 == 0,
-                        "Tensor pointer must be 16 byte aligned"
-                    );
-                    let lib = unsafe { cudarc::driver::sys::lib() };
-                    let mut map_ptr = MaybeUninit::zeroed();
+                        .result()
+                        .unwrap()
+                    },
+                    TensorMapFormat::Im2col {
+                        pixel_box_lower_corner,
+                        pixel_box_upper_corner,
+                        channels_per_pixel,
+                        pixels_per_column,
+                    } => unsafe {
+                        debug_assert_eq!(pixel_box_lower_corner.len(), map.rank - 2);
+                        debug_assert_eq!(pixel_box_upper_corner.len(), map.rank - 2);
 
-                    let shape: Vec<_> = map.shape.iter().rev().map(|s| *s as u64).collect();
-                    let strides: Vec<_> = map
-                        .strides
-                        .iter()
-                        .rev()
-                        .skip(1)
-                        .map(|s| *s as u64 * map.elem.size() as u64)
-                        .collect();
-                    let elem_stride: Vec<_> =
-                        map.elem_stride.iter().rev().map(|s| *s as u32).collect();
+                        let lower_corner: Vec<_> =
+                            pixel_box_lower_corner.iter().rev().copied().collect();
+                        let upper_corner: Vec<_> =
+                            pixel_box_upper_corner.iter().rev().copied().collect();
 
-                    assert!(
-                        strides.iter().all(|it| it % 16 == 0),
-                        "Strides must be 16 byte aligned"
-                    );
-
-                    match &map.format {
-                        TensorMapFormat::Tiled { tile_size } => unsafe {
-                            assert_eq!(tile_size.len(), map.rank, "Tile shape should match rank");
-                            let tile_size: Vec<_> = tile_size.iter().rev().copied().collect();
-
-                            lib.cuTensorMapEncodeTiled(
-                                map_ptr.as_mut_ptr(),
-                                elem_to_tensor_map_type(map.elem),
-                                map.rank as u32,
-                                device_ptr,
-                                shape.as_ptr(),
-                                strides.as_ptr(),
-                                tile_size.as_ptr(),
-                                elem_stride.as_ptr(),
-                                interleave_to_cuda(map.interleave),
-                                swizzle_to_cuda(map.swizzle),
-                                prefetch_to_cuda(map.prefetch),
-                                oob_to_cuda(map.oob_fill),
-                            )
-                            .result()
-                            .unwrap()
-                        },
-                        TensorMapFormat::Im2col {
-                            pixel_box_lower_corner,
-                            pixel_box_upper_corner,
-                            channels_per_pixel,
-                            pixels_per_column,
-                        } => unsafe {
-                            lib.cuTensorMapEncodeIm2col(
-                                map_ptr.as_mut_ptr(),
-                                elem_to_tensor_map_type(map.elem),
-                                map.rank as u32,
-                                resource.as_binding(),
-                                shape.as_ptr(),
-                                strides.as_ptr(),
-                                pixel_box_lower_corner.as_ptr(),
-                                pixel_box_upper_corner.as_ptr(),
-                                *channels_per_pixel,
-                                *pixels_per_column,
-                                elem_stride.as_ptr(),
-                                interleave_to_cuda(map.interleave),
-                                swizzle_to_cuda(map.swizzle),
-                                prefetch_to_cuda(map.prefetch),
-                                oob_to_cuda(map.oob_fill),
-                            )
-                            .result()
-                            .unwrap()
-                        },
-                        TensorMapFormat::Im2colWide { .. } => {
-                            unimplemented!("Not yet implemented in cudarc")
-                        }
-                    };
-                    unsafe { map_ptr.assume_init() }
-                }
+                        lib.cuTensorMapEncodeIm2col(
+                            map_ptr.as_mut_ptr(),
+                            elem_to_tensor_map_type(map.elem),
+                            map.rank as u32,
+                            device_ptr,
+                            shape.as_ptr(),
+                            strides.as_ptr(),
+                            lower_corner.as_ptr(),
+                            upper_corner.as_ptr(),
+                            *channels_per_pixel,
+                            *pixels_per_column,
+                            elem_stride.as_ptr(),
+                            interleave_to_cuda(map.interleave),
+                            swizzle_to_cuda(map.swizzle),
+                            prefetch_to_cuda(map.prefetch),
+                            oob_to_cuda(map.oob_fill),
+                        )
+                        .result()
+                        .unwrap()
+                    },
+                    TensorMapFormat::Im2colWide { .. } => {
+                        unimplemented!("Not yet implemented in cudarc")
+                    }
+                };
+                unsafe { map_ptr.assume_init() }
             })
             .collect::<_>();
 
-        let resources = bindings
+        let mut resources = bindings
+            .buffers
             .into_iter()
-            .map(|binding| {
-                ctx.memory_management
-                    .get_resource(binding.memory, binding.offset_start, binding.offset_end)
-                    .expect("Failed to find resource")
-            })
+            .map(|binding| find_resource(ctx, binding))
             .collect::<Vec<_>>();
+        resources.extend(
+            scalar_bindings
+                .into_iter()
+                .map(|s| find_resource(ctx, s.binding())),
+        );
 
         if let Some(level) = profile_level {
             ctx.sync();
             let start = std::time::SystemTime::now();
-            ctx.execute_task(kernel_id, count, &tensor_maps, &resources);
+            ctx.execute_task(kernel_id, count, &tensor_maps, &resources, &scalars);
             ctx.sync();
 
             let (name, kernel_id) = profile_info.unwrap();
@@ -498,7 +526,7 @@ impl ComputeServer for CudaServer {
             self.logger
                 .register_profiled(info, start.elapsed().unwrap());
         } else {
-            ctx.execute_task(kernel_id, count, &tensor_maps, &resources);
+            ctx.execute_task(kernel_id, count, &tensor_maps, &resources, &scalars);
         }
     }
 
@@ -509,22 +537,16 @@ impl ComputeServer for CudaServer {
         self.sync_stream_async()
     }
 
-    fn sync_elapsed(&mut self) -> impl Future<Output = TimestampsResult> + 'static {
+    fn start_profile(&mut self) {
+        // Wait for current work to be done.
+        self.ctx.sync();
+        self.ctx.timestamps.start();
+    }
+
+    fn end_profile(&mut self) -> ProfileDuration {
         self.logger.profile_summary();
-
-        let ctx = self.get_context();
-        ctx.sync();
-
-        let duration = match &mut ctx.timestamps {
-            KernelTimestamps::Inferred { start_time } => {
-                let duration = start_time.elapsed();
-                *start_time = Instant::now();
-                Ok(duration)
-            }
-            KernelTimestamps::Disabled => Err(TimestampsError::Disabled),
-        };
-
-        async move { duration }
+        self.ctx.sync();
+        self.ctx.timestamps.stop()
     }
 
     fn get_resource(&mut self, binding: server::Binding) -> BindingResource<CudaResource> {
@@ -544,16 +566,12 @@ impl ComputeServer for CudaServer {
     fn memory_cleanup(&mut self) {
         self.ctx.memory_management.cleanup(true);
     }
+}
 
-    fn enable_timestamps(&mut self) {
-        self.ctx.timestamps.enable();
-    }
-
-    fn disable_timestamps(&mut self) {
-        if self.logger.profile_level().is_none() {
-            self.ctx.timestamps.disable();
-        }
-    }
+fn find_resource(ctx: &mut CudaContext, binding: server::Binding) -> CudaResource {
+    ctx.memory_management
+        .get_resource(binding.memory, binding.offset_start, binding.offset_end)
+        .expect("Failed to find resource")
 }
 
 impl CudaContext {
@@ -572,7 +590,7 @@ impl CudaContext {
             ptx_cache: Cache::new("cuda/ptx", CacheOption::default()),
             stream,
             arch,
-            timestamps: KernelTimestamps::Disabled,
+            timestamps: KernelTimestamps::default(),
             compilation_options,
         }
     }
@@ -613,7 +631,6 @@ impl CudaContext {
                     y: entry.cube_dim.1,
                     z: entry.cube_dim.2,
                 },
-                entry.shared_mem_bytes,
             );
             return;
         }
@@ -631,9 +648,8 @@ impl CudaContext {
         }
 
         let compute_kernel = kernel_compiled.repr.as_ref().unwrap();
-        let shared_mem_bytes = compute_kernel.shared_memory_size();
         let cube_dim = kernel_compiled.cube_dim;
-        let fast_math = compute_kernel.fast_math;
+        let fast_math = compute_kernel.flags.inst_fast_math;
         let arch = format!("--gpu-architecture=sm_{}", self.arch);
 
         let include_path = include_path();
@@ -642,6 +658,9 @@ impl CudaContext {
         if fast_math {
             options.push("--use_fast_math");
         }
+
+        #[cfg(feature = "cache-ptx")]
+        let cluster_dim = compute_kernel.cluster_dim;
 
         let kernel_compiled = logger.debug(kernel_compiled);
 
@@ -672,7 +691,7 @@ impl CudaContext {
                 PtxCacheEntry {
                     entrypoint_name: kernel_compiled.entrypoint_name.clone(),
                     cube_dim: (cube_dim.x, cube_dim.y, cube_dim.z),
-                    shared_mem_bytes,
+                    cluster_dim: cluster_dim.map(|cluster| (cluster.x, cluster.y, cluster.z)),
                     ptx: ptx.clone(),
                 },
             )
@@ -683,7 +702,6 @@ impl CudaContext {
             kernel_id.clone(),
             kernel_compiled.entrypoint_name,
             cube_dim,
-            shared_mem_bytes,
         );
     }
 
@@ -693,7 +711,6 @@ impl CudaContext {
         kernel_id: KernelId,
         entrypoint_name: String,
         cube_dim: CubeDim,
-        shared_mem_bytes: usize,
     ) {
         let func_name = CString::new(entrypoint_name).unwrap();
         let func = unsafe {
@@ -702,14 +719,8 @@ impl CudaContext {
             cudarc::driver::result::module::get_function(module, func_name).unwrap()
         };
 
-        self.module_names.insert(
-            kernel_id.clone(),
-            CompiledKernel {
-                cube_dim,
-                shared_mem_bytes,
-                func,
-            },
-        );
+        self.module_names
+            .insert(kernel_id.clone(), CompiledKernel { cube_dim, func });
     }
 
     fn execute_task(
@@ -718,12 +729,14 @@ impl CudaContext {
         dispatch_count: (u32, u32, u32),
         tensor_maps: &[CUtensorMap],
         resources: &[CudaResource],
+        scalars: &[*mut c_void],
     ) {
         let mut bindings = tensor_maps
             .iter()
             .map(|map| map as *const _ as *mut c_void)
             .collect::<Vec<_>>();
         bindings.extend(resources.iter().map(|memory| memory.as_binding()));
+        bindings.extend(scalars);
 
         let kernel = self.module_names.get(&kernel_id).unwrap();
         let cube_dim = kernel.cube_dim;
@@ -732,7 +745,10 @@ impl CudaContext {
                 kernel.func,
                 dispatch_count,
                 (cube_dim.x, cube_dim.y, cube_dim.z),
-                kernel.shared_mem_bytes as u32,
+                // Shared memory is specified statically in the kernel, and no dynamic shared
+                // memory is supported yet in the kernel, which would be that value for the
+                // current kernel launch.
+                0,
                 self.stream,
                 &mut bindings,
             )
@@ -743,11 +759,8 @@ impl CudaContext {
 
 impl CudaServer {
     /// Create a new cuda server.
-    pub(crate) fn new(mut ctx: CudaContext) -> Self {
+    pub(crate) fn new(ctx: CudaContext) -> Self {
         let logger = DebugLogger::default();
-        if logger.profile_level().is_some() {
-            ctx.timestamps.enable();
-        }
         Self { ctx, logger }
     }
 

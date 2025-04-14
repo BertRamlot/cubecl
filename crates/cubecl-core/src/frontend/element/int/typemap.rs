@@ -1,7 +1,11 @@
 use bytemuck::{Pod, Zeroable};
 use core::ops::*;
 use cubecl_ir::{Elem, ExpandElement, IntKind, Scope, Variable};
-use derive_more::derive::*;
+use derive_more::derive::{
+    Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Display, Div,
+    DivAssign, Mul, MulAssign, Neg, Not, Rem, RemAssign, Shl, ShlAssign, Shr, ShrAssign, Sub,
+    SubAssign,
+};
 use num_traits::{NumCast, ToPrimitive};
 use serde::Serialize;
 
@@ -191,6 +195,7 @@ impl<const POS: u8> Abs for IntExpand<POS> {}
 impl<const POS: u8> Max for IntExpand<POS> {}
 impl<const POS: u8> Min for IntExpand<POS> {}
 impl<const POS: u8> Clamp for IntExpand<POS> {}
+impl<const POS: u8> MulHi for IntExpand<POS> {}
 
 impl<const POS: u8> BitwiseNot for IntExpand<POS> {}
 impl<const POS: u8> ReverseBits for IntExpand<POS> {}

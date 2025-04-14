@@ -17,10 +17,10 @@ use crate::{
     device::CudaDevice,
 };
 use cubecl_cpp::{
-    CudaCompiler, WmmaCompiler,
+    CudaCompiler, DialectWmmaCompiler,
     cuda::{arch::CudaArchitecture, mma::CudaWmmaCompiler},
     register_supported_types,
-    shared::register_wmma_features,
+    shared::{CompilationOptions, register_wmma_features},
 };
 
 /// Options configuring the CUDA runtime.
@@ -78,6 +78,8 @@ fn create_client(device: &CudaDevice, options: RuntimeOptions) -> ComputeClient<
         alignment: CudaStorage::ALIGNMENT,
     };
 
+    let mut comp_opts = CompilationOptions::default();
+
     let hardware_props = unsafe {
         use cudarc::driver::{result::device::get_attribute, sys::CUdevice_attribute::*};
         let warp_size = get_attribute(device_ptr, CU_DEVICE_ATTRIBUTE_WARP_SIZE).unwrap() as u32;
@@ -97,6 +99,13 @@ fn create_client(device: &CudaDevice, options: RuntimeOptions) -> ComputeClient<
         let max_cube_count =
             CubeDim::new_3d(grid_dim_x as u32, grid_dim_y as u32, grid_dim_z as u32);
 
+        let num_streaming_multiprocessors = Some(
+            get_attribute(device_ptr, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).unwrap() as u32,
+        );
+        let num_tensor_cores = tensor_cores_per_sm(arch.version);
+
+        comp_opts.warp_size = warp_size;
+
         HardwareProperties {
             plane_size_min: warp_size,
             plane_size_max: warp_size,
@@ -105,12 +114,15 @@ fn create_client(device: &CudaDevice, options: RuntimeOptions) -> ComputeClient<
             max_cube_count,
             max_units_per_cube: max_threads,
             max_cube_dim,
+            num_streaming_multiprocessors,
+            num_tensor_cores,
         }
     };
 
     let memory_management =
         MemoryManagement::from_configuration(storage, &mem_properties, options.memory_config);
 
+    let mut compilation_options = CompilationOptions::default();
     let mut device_props = DeviceProperties::new(&[Feature::Plane], mem_properties, hardware_props);
     register_supported_types(&mut device_props);
     device_props.register_feature(Feature::Type(Elem::Float(FloatKind::TF32)));
@@ -121,9 +133,13 @@ fn create_client(device: &CudaDevice, options: RuntimeOptions) -> ComputeClient<
         device_props.register_feature(Feature::Type(Elem::AtomicFloat(FloatKind::F16)));
         device_props.register_feature(Feature::Pipeline);
         device_props.register_feature(Feature::Barrier);
+
+        comp_opts.grid_constants = true;
     }
     if arch.version >= 90 {
         device_props.register_feature(Feature::Tma(TmaFeature::Base));
+        device_props.register_feature(Feature::CubeCluster);
+        compilation_options.supports_clusters = true;
     }
     if arch.version >= 100 {
         device_props.register_feature(Feature::Tma(TmaFeature::Im2colWide));
@@ -138,10 +154,19 @@ fn create_client(device: &CudaDevice, options: RuntimeOptions) -> ComputeClient<
     device_props.register_feature(Feature::AtomicFloat(AtomicFeature::LoadStore));
     device_props.register_feature(Feature::AtomicFloat(AtomicFeature::Add));
 
-    let comp_opts = Default::default();
+    device_props.register_feature(Feature::DynamicLineSize);
+
     let cuda_ctx = CudaContext::new(memory_management, comp_opts, stream, ctx, arch);
     let server = CudaServer::new(cuda_ctx);
     ComputeClient::new(MutexComputeChannel::new(server), device_props, ())
+}
+
+fn tensor_cores_per_sm(version: u32) -> Option<u32> {
+    match version {
+        70 | 75 => Some(8),                           // Volta, Turing
+        80 | 86 | 89 | 90 | 91 | 92 | 100 => Some(4), // Ampere, Hopper, Blackwell
+        _ => None,                                    // Unknown or unsupported architecture
+    }
 }
 
 impl Runtime for CudaRuntime {

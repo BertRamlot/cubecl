@@ -5,7 +5,8 @@ use quote::{ToTokens, quote};
 use std::{collections::HashMap, iter};
 use syn::{
     Expr, FnArg, Generics, Ident, ItemFn, LitStr, ReturnType, Signature, TraitItemFn, Type,
-    Visibility, parse_quote, punctuated::Punctuated, spanned::Spanned, visit_mut::VisitMut,
+    TypeMacro, Visibility, parse, parse_quote, punctuated::Punctuated, spanned::Spanned,
+    visit_mut::VisitMut,
 };
 
 use super::{desugar::Desugar, helpers::is_comptime_attr, statement::parse_pat};
@@ -18,6 +19,7 @@ pub(crate) struct KernelArgs {
     pub fast_math: Option<Expr>,
     pub debug: Flag,
     pub create_dummy_kernel: Flag,
+    pub cluster_dim: Option<Expr>,
     pub src_file: Option<LitStr>,
 }
 
@@ -184,6 +186,7 @@ pub struct KernelFn {
     pub sig: KernelSignature,
     pub body: KernelBody,
     pub full_name: String,
+    pub debug_symbols: bool,
     pub span: Span,
     pub context: Context,
     pub src_file: Option<LitStr>,
@@ -304,8 +307,19 @@ impl KernelSignature {
         let name = sig.ident;
         let generics = sig.generics;
         let returns = match sig.output {
-            syn::ReturnType::Default => parse_quote![()],
-            syn::ReturnType::Type(_, ty) => *ty,
+            syn::ReturnType::Default => KernelReturns::ExpandType(parse_quote![()]),
+            syn::ReturnType::Type(_, ty) => match *ty.clone() {
+                Type::Macro(TypeMacro { mac }) => {
+                    if mac.path.is_ident("comptime_type") {
+                        let inner_type = parse::<Type>(mac.tokens.into())
+                            .expect("Interior of comptime_type macro should be a valid type.");
+                        KernelReturns::Plain(inner_type)
+                    } else {
+                        panic!("Only comptime_type macro supported on return type")
+                    }
+                }
+                _ => KernelReturns::ExpandType(*ty),
+            },
         };
         let parameters = sig
             .inputs
@@ -317,30 +331,12 @@ impl KernelSignature {
             generics,
             name,
             parameters,
-            returns: KernelReturns::ExpandType(returns),
+            returns,
         })
     }
 
     pub fn from_trait_fn(function: TraitItemFn) -> syn::Result<Self> {
-        let name = function.sig.ident;
-        let generics = function.sig.generics;
-        let returns = match function.sig.output {
-            syn::ReturnType::Default => parse_quote![()],
-            syn::ReturnType::Type(_, ty) => *ty,
-        };
-        let parameters = function
-            .sig
-            .inputs
-            .into_iter()
-            .map(KernelParam::from_param)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(Self {
-            generics,
-            name,
-            parameters,
-            returns: KernelReturns::ExpandType(returns),
-        })
+        Self::from_signature(function.sig)
     }
 
     /// If the type is self, we set the returns type to plain instead of expand type.
@@ -365,12 +361,13 @@ impl KernelFn {
         mut block: syn::Block,
         full_name: String,
         src_file: Option<LitStr>,
+        debug_symbols: bool,
     ) -> syn::Result<Self> {
         let span = Span::call_site();
         let sig = KernelSignature::from_signature(sig)?;
         Desugar.visit_block_mut(&mut block);
 
-        let mut context = Context::new(sig.returns.ty());
+        let mut context = Context::new(sig.returns.ty(), debug_symbols);
         context.extend(sig.parameters.clone());
         let (block, _) = context.in_scope(|ctx| Block::from_block(block, ctx))?;
 
@@ -382,6 +379,7 @@ impl KernelFn {
             span,
             src_file,
             context,
+            debug_symbols,
         })
     }
 }
@@ -403,6 +401,7 @@ impl Launch {
             *function.block,
             full_name,
             args.src_file.clone(),
+            args.debug_symbols.is_present(),
         )?;
 
         // Bail early if the user tries to have a return type in a launch kernel.

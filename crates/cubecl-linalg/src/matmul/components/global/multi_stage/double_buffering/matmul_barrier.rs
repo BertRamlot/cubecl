@@ -1,13 +1,13 @@
 use crate::matmul::components::Ident;
-use crate::matmul::components::global::IndexedQuantization;
-use crate::matmul::components::global::multi_stage::AsyncBufferLoader;
-use crate::matmul::components::global::multi_stage::BufferLoader;
-use crate::matmul::components::global::multi_stage::double_buffering::BufferId;
+use crate::matmul::components::InputIdent;
+use crate::matmul::components::global::Quantization;
+use crate::matmul::components::global::load::{
+    AsyncBufferLoader, AsyncBufferLoadingStrategy, BufferId,
+};
 use crate::matmul::components::global::output_loader::Unloader;
-use crate::matmul::components::global::single_stage::AsyncBufferLoadingStrategy;
 use crate::matmul::components::global::{self, CommonGlobalConfig};
 use crate::matmul::components::global::{GlobalConfig, ZeroAccumulatorLoader};
-use crate::matmul::components::stage::single_buffer::{LhsBufferReader, RhsBufferReader};
+use crate::matmul::components::stage::BufferReader;
 use crate::matmul::components::{MatmulPrecision, stage};
 use cubecl_core::Feature;
 use cubecl_core::prelude::barrier::Barrier;
@@ -22,13 +22,8 @@ use crate::matmul::components::InvalidConfigError;
 use crate::matmul::components::MatmulConfigFactory;
 use crate::matmul::components::MatmulProblem;
 use crate::matmul::components::global::GlobalMatmulFamily;
-use crate::matmul::components::stage::single_buffer::{
-    LhsBufferReaderFamily, RhsBufferReaderFamily,
-};
+use crate::matmul::components::stage::BufferReaderFamily;
 use crate::matmul::kernels::MatmulAvailabilityError;
-
-use super::AsyncLhsBufferLoader;
-use super::AsyncRhsBufferLoader;
 
 pub struct DoubleBufferingBarrierMatmulFamily<
     SMM: stage::StageMatmulFamily,
@@ -42,16 +37,13 @@ pub struct DoubleBufferingBarrierMatmulFamily<
 
 impl<SMM, LL, RL> GlobalMatmulFamily for DoubleBufferingBarrierMatmulFamily<SMM, LL, RL>
 where
-    SMM: stage::StageMatmulFamily<
-            LhsReader = LhsBufferReaderFamily,
-            RhsReader = RhsBufferReaderFamily,
-        >,
+    SMM: stage::StageMatmulFamily<LhsReader = BufferReaderFamily, RhsReader = BufferReaderFamily>,
     LL: AsyncBufferLoadingStrategy,
     RL: AsyncBufferLoadingStrategy,
 {
     type Matmul<MP: MatmulPrecision> = DoubleBufferingBarrierMatmul<
         MP,
-        SMM::Matmul<MP::ES, MP::EG, MP::EA, LL::TilingLayout, RL::TilingLayout>,
+        SMM::Matmul<MP, LL::TilingLayout, RL::TilingLayout>,
         LL,
         RL,
     >;
@@ -118,7 +110,7 @@ where
 /// they trigger a computation event from tensor cores on buffer B. Then buffers are switched.
 pub struct DoubleBufferingBarrierMatmul<
     MP: MatmulPrecision,
-    SMM: stage::StageMatmul<MP::ES, MP::EG, MP::EA>,
+    SMM: stage::StageMatmul<MP>,
     LL: AsyncBufferLoadingStrategy,
     RL: AsyncBufferLoadingStrategy,
 > {
@@ -133,20 +125,18 @@ impl<MP: MatmulPrecision, SMM, LL, RL> global::GlobalMatmul<MP>
     for DoubleBufferingBarrierMatmul<MP, SMM, LL, RL>
 where
     SMM: stage::StageMatmul<
-            MP::ES,
-            MP::EG,
-            MP::EA,
-            LhsReader = LhsBufferReader<MP::ES, LL::TilingLayout>,
-            RhsReader = RhsBufferReader<MP::ES, RL::TilingLayout>,
+            MP,
+            LhsReader = BufferReader<MP::ES, LL::TilingLayout>,
+            RhsReader = BufferReader<MP::ES, RL::TilingLayout>,
         >,
     LL: AsyncBufferLoadingStrategy,
     RL: AsyncBufferLoadingStrategy,
 {
     type Config = CommonGlobalConfig<SMM::Config>;
-    type LhsLoader = AsyncLhsBufferLoader<MP::EG, MP::ES, SMM::Config, LL>;
-    type RhsLoader = AsyncRhsBufferLoader<MP::EG, MP::ES, SMM::Config, RL>;
+    type LhsLoader = AsyncBufferLoader<MP, SMM::Config, Barrier<MP::ES>, LL>;
+    type RhsLoader = AsyncBufferLoader<MP, SMM::Config, Barrier<MP::ES>, RL>;
     type AccumulatorLoader = ZeroAccumulatorLoader;
-    type Out = Unloader<MP::EG>;
+    type Out = Unloader<MP::EO>;
     type Accumulator = SMM::Accumulator;
 
     fn execute(
@@ -155,7 +145,6 @@ where
         mut out_unloader: Self::Out,
         acc: &mut Self::Accumulator,
         k_range: (u32, u32),
-        _quantization: CubeOption<IndexedQuantization<MP::EG>>,
         #[comptime] config: Self::Config,
     ) {
         let num_buffers = 2;
@@ -177,7 +166,6 @@ where
         let rhs_buffer_reader_b = Self::RhsLoader::reader(&rhs_loader, BufferId::B);
 
         let barrier_level = LL::barrier_level();
-        comptime!(assert!(barrier_level == RL::barrier_level()));
         let barrier_a = Barrier::<MP::ES>::new(barrier_level);
         let barrier_b = Barrier::<MP::ES>::new(barrier_level);
 
@@ -189,18 +177,8 @@ where
                 sync_units();
             }
         }
-        Self::LhsLoader::fill_stage::<Barrier<MP::ES>>(
-            &mut lhs_loader,
-            &barrier_a,
-            BufferId::A,
-            config,
-        );
-        Self::RhsLoader::fill_stage::<Barrier<MP::ES>>(
-            &mut rhs_loader,
-            &barrier_a,
-            BufferId::A,
-            config,
-        );
+        Self::LhsLoader::fill_stage(&mut lhs_loader, &barrier_a, BufferId::A, config);
+        Self::RhsLoader::fill_stage(&mut rhs_loader, &barrier_a, BufferId::A, config);
         barrier_a.arrive();
 
         // So it can do the first iteration
@@ -208,18 +186,8 @@ where
 
         for loop_iter in 0..num_loops {
             barrier_b.wait();
-            Self::LhsLoader::fill_stage::<Barrier<MP::ES>>(
-                &mut lhs_loader,
-                &barrier_b,
-                BufferId::B,
-                config,
-            );
-            Self::RhsLoader::fill_stage::<Barrier<MP::ES>>(
-                &mut rhs_loader,
-                &barrier_b,
-                BufferId::B,
-                config,
-            );
+            Self::LhsLoader::fill_stage(&mut lhs_loader, &barrier_b, BufferId::B, config);
+            Self::RhsLoader::fill_stage(&mut rhs_loader, &barrier_b, BufferId::B, config);
             barrier_b.arrive();
 
             barrier_a.wait();
@@ -229,7 +197,6 @@ where
                 &mut lhs_tile_a,
                 &mut rhs_tile_a,
                 acc,
-                CubeOption::new_None(),
                 config.to_smm_config(),
             );
             barrier_a.arrive();
@@ -241,7 +208,6 @@ where
                 &mut lhs_tile_b,
                 &mut rhs_tile_b,
                 acc,
-                CubeOption::new_None(),
                 config.to_smm_config(),
             );
             barrier_b.arrive();
@@ -259,18 +225,8 @@ where
                     sync_units();
                 }
             }
-            Self::LhsLoader::fill_stage::<Barrier<MP::ES>>(
-                &mut lhs_loader,
-                &barrier_a,
-                BufferId::A,
-                config,
-            );
-            Self::RhsLoader::fill_stage::<Barrier<MP::ES>>(
-                &mut rhs_loader,
-                &barrier_a,
-                BufferId::A,
-                config,
-            );
+            Self::LhsLoader::fill_stage(&mut lhs_loader, &barrier_a, BufferId::A, config);
+            Self::RhsLoader::fill_stage(&mut rhs_loader, &barrier_a, BufferId::A, config);
             barrier_a.arrive();
         }
 
@@ -282,18 +238,8 @@ where
             // TODO can we remove
             sync_units();
         }
-        Self::LhsLoader::fill_stage::<Barrier<MP::ES>>(
-            &mut lhs_loader,
-            &barrier_b,
-            BufferId::B,
-            config,
-        );
-        Self::RhsLoader::fill_stage::<Barrier<MP::ES>>(
-            &mut rhs_loader,
-            &barrier_b,
-            BufferId::B,
-            config,
-        );
+        Self::LhsLoader::fill_stage(&mut lhs_loader, &barrier_b, BufferId::B, config);
+        Self::RhsLoader::fill_stage(&mut rhs_loader, &barrier_b, BufferId::B, config);
         barrier_b.arrive();
 
         barrier_a.wait();
@@ -303,7 +249,6 @@ where
             &mut lhs_tile_a,
             &mut rhs_tile_a,
             acc,
-            CubeOption::new_None(),
             config.to_smm_config(),
         );
         barrier_a.arrive();
@@ -315,7 +260,6 @@ where
             &mut lhs_tile_b,
             &mut rhs_tile_b,
             acc,
-            CubeOption::new_None(),
             config.to_smm_config(),
         );
         barrier_b.arrive();
@@ -323,36 +267,53 @@ where
         SMM::read_accumulator::<Self::Out, Self::Config>(
             acc,
             &mut out_unloader,
-            CubeOption::new_None(),
             config.to_smm_config(),
             config,
         );
     }
 
     fn init_lhs_loader(
-        lhs: VirtualTensor<MP::EG>,
+        lhs: VirtualTensor<MP::EI>,
         x_offset: u32,
         y_offset: u32,
         _nth_batch: u32,
         batch_offset: u32,
+        quantization: CubeOption<Quantization<MP>>,
         #[comptime] config: Self::Config,
     ) -> Self::LhsLoader {
-        Self::LhsLoader::new(lhs, x_offset, y_offset, batch_offset, config)
+        Self::LhsLoader::new(
+            lhs,
+            x_offset,
+            y_offset,
+            batch_offset,
+            quantization,
+            InputIdent::Lhs,
+            config,
+        )
     }
 
     fn init_rhs_loader(
-        rhs: VirtualTensor<MP::EG>,
+        rhs: VirtualTensor<MP::EI>,
         x_offset: u32,
         y_offset: u32,
         _nth_batch: u32,
         batch_offset: u32,
+        quantization: CubeOption<Quantization<MP>>,
         #[comptime] config: Self::Config,
     ) -> Self::RhsLoader {
-        Self::RhsLoader::new(rhs, x_offset, y_offset, batch_offset, config)
+        Self::RhsLoader::new(
+            rhs,
+            x_offset,
+            y_offset,
+            batch_offset,
+            quantization,
+            InputIdent::Rhs,
+            config,
+        )
     }
 
     fn init_unloader(
-        out: VirtualTensor<MP::EG, ReadWrite>,
+        out: VirtualTensor<MP::EO, ReadWrite>,
         x_offset: u32,
         y_offset: u32,
         _nth_batch: u32,

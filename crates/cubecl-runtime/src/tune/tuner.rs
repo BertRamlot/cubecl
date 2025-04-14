@@ -1,23 +1,20 @@
+use alloc::format;
+use alloc::vec::Vec;
 use async_channel::{Receiver, Sender};
 use cubecl_common::future;
 use hashbrown::HashSet;
 
-use core::future::Future;
-use cubecl_common::stub::Duration;
-
-#[cfg(not(target_family = "wasm"))]
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 
 use alloc::string::{String, ToString};
-use alloc::vec::Vec;
-use cubecl_common::benchmark::BenchmarkComputations;
+use cubecl_common::benchmark::{BenchmarkComputations, BenchmarkDurations};
 
 use crate::channel::ComputeChannel;
 use crate::client::ComputeClient;
 use crate::server::ComputeServer;
 use crate::tune::{TuneBenchmark, TuneCache};
 
-use super::{AutotuneKey, TunableSet, TuneCacheResult};
+use super::{AutotuneKey, AutotuneOutput, TunableSet, TuneCacheResult};
 
 #[derive(Debug)]
 /// Executes autotune benchmarking and caching
@@ -25,21 +22,19 @@ pub struct Tuner<K: AutotuneKey> {
     tune_cache: TuneCache<K>,
     channel: (Sender<AutotuneMessage<K>>, Receiver<AutotuneMessage<K>>),
     pub(crate) autotuning: HashSet<K>,
-    #[cfg(not(target_family = "wasm"))]
-    current: AtomicU64,
 }
 
+/// The measured outcome for a given autotune invocation.
 #[cfg_attr(
     autotune_persistent_cache,
     derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)
 )]
 #[derive(new, Debug, Clone)]
-pub(crate) struct AutotuneOutcome {
+pub struct AutotuneOutcome {
     name: String,
     index: usize,
     computation: BenchmarkComputations,
 }
-/// Result from running benchmarks.
 enum AutotuneMessage<K> {
     Done {
         key: K,
@@ -48,10 +43,11 @@ enum AutotuneMessage<K> {
         checksum: String,
         #[cfg(autotune_persistent_cache)]
         results: Vec<Result<AutotuneOutcome, String>>,
+        #[cfg(feature = "autotune-checks")]
+        autotune_checks: alloc::boxed::Box<dyn FnOnce() + Send>,
     },
-    Starting {
-        key: K,
-    },
+    #[allow(dead_code)]
+    Pending(K),
 }
 
 /// Error from running autotune.
@@ -77,8 +73,6 @@ impl<K: AutotuneKey> Tuner<K> {
             tune_cache: TuneCache::new(name, device_id),
             channel,
             autotuning: HashSet::new(),
-            #[cfg(not(target_family = "wasm"))]
-            current: 0.into(),
         }
     }
 
@@ -93,52 +87,42 @@ impl<K: AutotuneKey> Tuner<K> {
         self.tune_cache.validate_checksum(key, checksum)
     }
 
-    /// Wait for async results to come in.
-    pub fn resolve(&mut self) {
-        #[cfg(not(target_family = "wasm"))]
-        // On native platforms, we know exactly how many tasks to wait for.
-        //
-        // Those tasks can be registered from another thread, but since the tuner shares the same
-        // state, we can wait for all results to be saved before deciding which kernel to launch.
-        // This may happen if multiple threads trigger the same autotune task.
-        while self.current.load(Ordering::Relaxed) > 0 {
-            self.resolve_loop();
-        }
+    /// Handle an autotune result message, see [`execute_autotune`]
+    fn handle_result(&mut self, msg: AutotuneMessage<K>) {
+        match msg {
+            AutotuneMessage::Pending(key) => {
+                self.tune_cache.mark_pending(key);
+            }
+            AutotuneMessage::Done {
+                key,
+                fastest_index,
+                #[cfg(autotune_persistent_cache)]
+                checksum,
+                #[cfg(autotune_persistent_cache)]
+                results,
+                #[cfg(feature = "autotune-checks")]
+                    autotune_checks: check,
+            } => {
+                self.tune_cache.cache_insert(key.clone(), fastest_index);
 
-        #[cfg(target_family = "wasm")]
-        self.resolve_loop();
-    }
+                #[cfg(feature = "autotune-checks")]
+                check();
 
-    fn resolve_loop(&mut self) {
-        while let Ok(msg) = self.channel.1.try_recv() {
-            match msg {
-                AutotuneMessage::Done {
-                    key,
-                    fastest_index,
-                    #[cfg(autotune_persistent_cache)]
-                    checksum,
-                    #[cfg(autotune_persistent_cache)]
-                    results,
-                } => {
-                    #[cfg(not(target_family = "wasm"))]
-                    AtomicU64::fetch_sub(&self.current, 1, Ordering::Relaxed);
-
-                    self.tune_cache.cache_insert(key.clone(), fastest_index);
-
-                    #[cfg(autotune_persistent_cache)]
-                    {
-                        self.tune_cache.persistent_cache_insert(
-                            key,
-                            checksum,
-                            fastest_index,
-                            results,
-                        );
-                    }
-                }
-                AutotuneMessage::Starting { key } => {
-                    self.tune_cache.mark_pending(key);
+                #[cfg(autotune_persistent_cache)]
+                {
+                    self.tune_cache
+                        .persistent_cache_insert(key, checksum, fastest_index, results);
                 }
             }
+        }
+    }
+
+    /// Check if any autotuning results have come in asynchronously.
+    pub fn handle_results(&mut self) {
+        // Handle any results that have come in. Note that execute_autotune pushes results to the channel immediately if possible.
+        // Since this function takes an &mut we know we have exclusive access, and no other threads are currently still adding results.
+        while let Ok(msg) = self.channel.1.try_recv() {
+            self.handle_result(msg);
         }
     }
 
@@ -147,7 +131,7 @@ impl<K: AutotuneKey> Tuner<K> {
         S: ComputeServer + 'static,
         C: ComputeChannel<S> + 'static,
         In: Clone + Send + 'static,
-        Out: Send + 'static,
+        Out: AutotuneOutput,
     >(
         &self,
         key: K,
@@ -155,9 +139,6 @@ impl<K: AutotuneKey> Tuner<K> {
         tunables: &TunableSet<K, In, Out>,
         client: &ComputeClient<S, C>,
     ) {
-        #[cfg(not(target_family = "wasm"))]
-        AtomicU64::fetch_add(&self.current, 1, Ordering::Relaxed);
-
         log::info!("Tuning {key}");
 
         let autotunables: Vec<_> = tunables
@@ -168,76 +149,91 @@ impl<K: AutotuneKey> Tuner<K> {
             .collect();
 
         let client = client.clone();
-        let sender = self.channel.0.clone();
 
-        if autotunables.len() == 1 {
-            sender
-                .try_send(AutotuneMessage::Done {
+        let message = 'message: {
+            if autotunables.len() == 1 {
+                break 'message AutotuneMessage::Done {
                     key,
                     fastest_index: autotunables[0].0,
                     #[cfg(autotune_persistent_cache)]
                     checksum: tunables.compute_checksum(),
                     #[cfg(autotune_persistent_cache)]
                     results: Vec::new(),
-                })
-                .expect("Autotune results channel closed");
-            return;
-        }
+                    #[cfg(feature = "autotune-checks")]
+                    autotune_checks: Box::new(|| {}),
+                };
+            }
 
-        sender
-            .try_send(AutotuneMessage::Starting { key: key.clone() })
-            .expect("Autotune results channel closed");
+            #[cfg(autotune_persistent_cache)]
+            let checksum = tunables.compute_checksum();
+            let test_inputs = tunables.generate_inputs(&key, inputs);
 
-        #[cfg(autotune_persistent_cache)]
-        let checksum = tunables.compute_checksum();
+            #[cfg(feature = "autotune-checks")]
+            let mut checks_outputs = Vec::new();
 
-        let test_inputs = tunables.generate_inputs(&key, inputs);
-
-        spawn_benchmark_task(async move {
-            let mut bench_results = Vec::with_capacity(autotunables.len());
+            let mut tunable_profiles = Vec::with_capacity(autotunables.len());
 
             for (index, op) in autotunables.into_iter() {
                 let name = op.name().to_string();
                 let tuner = TuneBenchmark::new(op, test_inputs.clone(), client.clone());
-
-                let sample_fut = tuner.sample_durations();
-                let result = sample_fut.await;
-                let result = result.map(|durations| {
-                    log::info!("Name: {name} => {}", durations);
-                    AutotuneOutcome::new(name, index, BenchmarkComputations::new(&durations))
-                });
-
-                bench_results.push(result);
+                #[cfg(feature = "autotune-checks")]
+                checks_outputs.push(tuner.output_for_checks());
+                let profiles = tuner.profile().map(|bench| (name, index, bench));
+                tunable_profiles.push(profiles);
             }
 
             // Panic if all tuners panicked.
-            #[cfg(all(feature = "std", not(target_family = "wasm")))]
-            if bench_results.iter().all(|result| result.is_err()) {
-                let first_error = bench_results.into_iter().next().unwrap().err().unwrap();
-
+            if tunable_profiles.iter().all(|result| result.is_err()) {
+                let first_error = tunable_profiles.into_iter().next().unwrap().err().unwrap();
                 match first_error {
                     AutotuneError::Unknown(reason) => panic!("{reason}"),
                 }
             }
 
-            // Finds the fastest operation (by the median time).
-            bench_results.sort_by(|a, b| {
-                let a = a
+            let key_clone = key.clone();
+            let fut_result = async move {
+                let mut bench_results = Vec::new();
+
+                for result in tunable_profiles {
+                    match result {
+                        Ok(result) => {
+                            let (name, index, profiles) = result;
+                            // Wait for the results to come in, and determine the outcome.
+                            let durations = BenchmarkDurations::from_profiles(profiles).await;
+                            let outcome = Ok(AutotuneOutcome::new(
+                                name,
+                                index,
+                                BenchmarkComputations::new(&durations),
+                            ));
+                            bench_results.push(outcome);
+                        }
+                        Err(err) => {
+                            bench_results.push(Err(format!("{err:?}")));
+                        }
+                    }
+                }
+
+                // Finds the fastest operation (by the median time).
+                bench_results.sort_by(|a, b| {
+                    let a = a
+                        .as_ref()
+                        .map(|r| r.computation.median)
+                        .unwrap_or(Duration::MAX);
+                    let b = b
+                        .as_ref()
+                        .map(|r| r.computation.median)
+                        .unwrap_or(Duration::MAX);
+
+                    a.cmp(&b)
+                });
+
+                // Log & send results.
+                let result = bench_results
+                    .first()
+                    .expect("At least one kernel needed.")
                     .as_ref()
-                    .map(|r| r.computation.median)
-                    .unwrap_or(Duration::MAX);
-                let b = b
-                    .as_ref()
-                    .map(|r| r.computation.median)
-                    .unwrap_or(Duration::MAX);
+                    .expect("At least one kernel has to succeed.");
 
-                a.cmp(&b)
-            });
-
-            // Log & send results.
-            let result = bench_results.first().expect("At least one kernel needed. ");
-
-            let fastest_index = if let Ok(result) = result {
                 let top_times = bench_results
                     .iter()
                     .map(|r| {
@@ -247,46 +243,64 @@ impl<K: AutotuneKey> Tuner<K> {
                     })
                     .take(3)
                     .collect::<Vec<_>>();
+
                 log::info!(
-                    "Fastest result {}-{key}. \n Top 3 times: {top_times:?}",
+                    "Fastest result {}-{key_clone}. \n Top 3 times: {top_times:?}",
                     result.name,
                 );
 
-                result.index
-            } else {
-                0
-            };
-
-            sender
-                .send(AutotuneMessage::Done {
-                    key,
-                    fastest_index,
+                AutotuneMessage::Done {
+                    key: key_clone,
+                    fastest_index: result.index,
                     #[cfg(autotune_persistent_cache)]
                     checksum,
                     #[cfg(autotune_persistent_cache)]
-                    results: bench_results
-                        .into_iter()
-                        .map(|result| result.map_err(|err| format!("{err:?}")))
-                        .collect(),
-                })
-                .await
-                .expect("Autotune results channel closed");
-        });
+                    results: bench_results,
+                    #[cfg(feature = "autotune-checks")]
+                    autotune_checks: Box::new(|| {
+                        check_autotune_outputs(checks_outputs);
+                    }),
+                }
+            };
+
+            cfg_if::cfg_if! {
+                if #[cfg(target_family = "wasm")] {
+                    let sender = self.channel.0.clone();
+                    let send_fut = async move {
+                        sender.try_send(fut_result.await).unwrap()
+                    };
+                    // On wasm, spawn the tuning as a detached task.
+                    wasm_bindgen_futures::spawn_local(send_fut);
+                    // Mark the current tuning as pending.
+                    AutotuneMessage::Pending(key)
+                } else {
+                    // On native, it is possible to run the tuning on a thread, which could help startup times,
+                    // but might have two downsides:
+                    // - Benchmarks would need a "warmup" time until a good kernel is selected.
+                    // - Tuning could be less precise, as it's possible that other operations are
+                    //   submitted while tuning, which might skew results.
+                    future::block_on(fut_result)
+                }
+            }
+        };
+
+        // Note that this message will be processed straight away by handle_results.
+        self.channel
+            .0
+            .try_send(message)
+            .expect("Loss message channel somehow");
     }
 }
 
-fn spawn_benchmark_task(future: impl Future<Output = ()> + Send + 'static) {
-    // On wasm, spawn the tuning as a detached task.
-    #[cfg(target_family = "wasm")]
-    wasm_bindgen_futures::spawn_local(future);
+#[cfg(feature = "autotune-checks")]
+pub(crate) fn check_autotune_outputs<O: AutotuneOutput>(
+    mut checks_outputs: Vec<Result<O, AutotuneError>>,
+) {
+    let reference = checks_outputs.remove(checks_outputs.len() - 1);
 
-    // On native, it is possible to run the tuning on a thread, which could help startup times,
-    // but might have two downsides:
-    // - Benchmarks would need a "warmup" time until a good kernel is selected.
-    // - Tuning could be less precise, as it's possible that other operations are
-    //   submitted while tuning, which might skew results.
-    //
-    // So, for now, just block on the future.
-    #[cfg(not(target_family = "wasm"))]
-    future::block_on(future);
+    if let Ok(reference) = reference {
+        for other in checks_outputs.into_iter().flatten() {
+            reference.check_equivalence(other);
+        }
+    }
 }

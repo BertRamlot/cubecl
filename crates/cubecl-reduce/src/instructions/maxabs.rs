@@ -1,15 +1,18 @@
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 
-use super::{Reduce, ReduceCoordinate, MonoidOperation};
+use crate::instructions::ReduceRequirements;
+
+use super::{ReduceCoordinate, ReduceFamily, MonoidOperation};
 
 // TODO Add to test framework.
 /// Return the item with the maximum absolute value.
-#[derive(Debug)]
+#[derive(Debug, CubeType, Clone)]
 pub struct MaxAbs;
 
-impl Reduce for MaxAbs {
+impl ReduceFamily for MaxAbs {
     type Instruction<In: Numeric> = Self;
+    type Config = ();
 }
 
 #[cube]
@@ -18,20 +21,33 @@ impl<In: Numeric> MonoidOperation<In> for MaxAbs {
 
     type AccumulatorItem = Line<In>;
     type SharedAccumulator = SharedMemory<Line<In>>;
+    type Config = ();
 
-    fn identity_input(#[comptime] line_size: u32) -> Line<In> {
+    fn requirements(_this: &Self) -> ReduceRequirements {
+        ReduceRequirements { coordinates: false }
+    }
+
+    fn from_config(_config: Self::Config) -> Self {
+        MaxAbs {}
+    }
+    fn identity_input(_this: &Self, #[comptime] line_size: u32) -> Line<In> {
         Line::empty(line_size).fill(In::min_value())
     }
 
-    fn identity_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem {
-        Self::identity_input(line_size)
+    fn identity_accumulator(this: &Self, #[comptime] line_size: u32) -> Self::AccumulatorItem {
+        Self::identity_input(this, line_size)
     }
 
-    fn assign_accumulator(destination: &mut Self::AccumulatorItem, source: &Self::AccumulatorItem) {
+    fn assign_accumulator(
+        _this: &Self,
+        destination: &mut Self::AccumulatorItem,
+        source: &Self::AccumulatorItem,
+    ) {
         *destination = *source;
     }
 
-    fn operate(
+    fn reduce(
+        _this: &Self,
         accumulator: &Self::AccumulatorItem,
         item: Line<In>,
         _coordinate: ReduceCoordinate,
@@ -51,25 +67,29 @@ impl<In: Numeric> MonoidOperation<In> for MaxAbs {
     }
 
     fn fuse_accumulators(
+        _this: &Self,
         lhs: Self::AccumulatorItem,
         rhs: Self::AccumulatorItem,
     ) -> Self::AccumulatorItem {
-        lhs + rhs
+        select_many(lhs.greater_than(rhs), lhs, rhs)
     }
 
     fn merge_line<Out: Numeric>(
+        _this: &Self,
         accumulator: Self::AccumulatorItem,
         _shape_axis_reduce: u32,
     ) -> Out {
-        let mut sum = In::from_int(0);
+        let mut max = In::min_value();
         #[unroll]
         for k in 0..accumulator.size() {
-            sum += accumulator[k];
+            let candidate = accumulator[k];
+            max = select(candidate > max, candidate, max);
         }
-        Out::cast_from(sum)
+        Out::cast_from(max)
     }
 
     fn to_output_perpendicular<Out: Numeric>(
+        _this: &Self,
         accumulator: Self::AccumulatorItem,
         _shape_axis_reduce: u32,
     ) -> Line<Out> {
