@@ -1,7 +1,7 @@
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 
-use super::{Reduce, ReduceCoordinate, ReduceInstruction};
+use super::{Reduce, ReduceCoordinate, MonoidOperation};
 
 // TODO Add to test framework.
 /// Return the item with the maximum absolute value.
@@ -13,25 +13,25 @@ impl Reduce for MaxAbs {
 }
 
 #[cube]
-impl<In: Numeric> ReduceInstruction<In> for MaxAbs {
+impl<In: Numeric> MonoidOperation<In> for MaxAbs {
     const REQUIRES_COORDINATE: bool = false;
 
     type AccumulatorItem = Line<In>;
     type SharedAccumulator = SharedMemory<Line<In>>;
 
-    fn null_input(#[comptime] line_size: u32) -> Line<In> {
+    fn identity_input(#[comptime] line_size: u32) -> Line<In> {
         Line::empty(line_size).fill(In::min_value())
     }
 
-    fn null_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem {
-        Self::null_input(line_size)
+    fn identity_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem {
+        Self::identity_input(line_size)
     }
 
     fn assign_accumulator(destination: &mut Self::AccumulatorItem, source: &Self::AccumulatorItem) {
         *destination = *source;
     }
 
-    fn reduce(
+    fn operate(
         accumulator: &Self::AccumulatorItem,
         item: Line<In>,
         _coordinate: ReduceCoordinate,

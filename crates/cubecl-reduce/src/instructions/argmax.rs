@@ -2,7 +2,7 @@ use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 
 use super::{
-    ArgAccumulator, Reduce, ReduceCoordinate, ReduceCoordinateExpand, ReduceInstruction,
+    ArgAccumulator, Reduce, ReduceCoordinate, ReduceCoordinateExpand, MonoidOperation,
     lowest_coordinate_matching,
 };
 
@@ -37,19 +37,19 @@ impl Reduce for ArgMax {
 }
 
 #[cube]
-impl<In: Numeric> ReduceInstruction<In> for ArgMax {
+impl<In: Numeric> MonoidOperation<In> for ArgMax {
     const REQUIRES_COORDINATE: bool = true;
 
     type AccumulatorItem = (Line<In>, Line<u32>);
     type SharedAccumulator = ArgAccumulator<In>;
 
-    fn null_input(#[comptime] line_size: u32) -> Line<In> {
+    fn identity_input(#[comptime] line_size: u32) -> Line<In> {
         Line::empty(line_size).fill(In::min_value())
     }
 
-    fn null_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem {
+    fn identity_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem {
         (
-            Self::null_input(line_size),
+            Self::identity_input(line_size),
             Line::empty(line_size).fill(u32::MAX),
         )
     }
@@ -59,7 +59,7 @@ impl<In: Numeric> ReduceInstruction<In> for ArgMax {
         destination.1 = source.1;
     }
 
-    fn reduce(
+    fn operate(
         accumulator: &Self::AccumulatorItem,
         item: Line<In>,
         coordinate: ReduceCoordinate,

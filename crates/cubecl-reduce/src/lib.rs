@@ -24,7 +24,7 @@ mod strategy;
 pub use config::*;
 pub use error::*;
 pub use instructions::Reduce;
-pub use instructions::ReduceInstruction;
+pub use instructions::MonoidOperation;
 pub use shared_sum::*;
 pub use strategy::*;
 
@@ -36,6 +36,12 @@ pub use launch::{ReduceParams, reduce_kernel};
 pub mod test;
 
 use cubecl_core::prelude::*;
+
+
+
+/// Contains scan kernels
+pub mod scan;
+
 
 /// Reduce the given `axis` of the `input` tensor using the instruction `Inst` and write the result into `output`.
 ///

@@ -1,7 +1,7 @@
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 
-use super::{Reduce, ReduceCoordinate, ReduceInstruction};
+use super::{Reduce, ReduceCoordinate, MonoidOperation};
 
 #[derive(Debug)]
 pub struct Prod;
@@ -11,25 +11,25 @@ impl Reduce for Prod {
 }
 
 #[cube]
-impl<In: Numeric> ReduceInstruction<In> for Prod {
+impl<In: Numeric> MonoidOperation<In> for Prod {
     const REQUIRES_COORDINATE: bool = false;
 
     type AccumulatorItem = Line<In>;
     type SharedAccumulator = SharedMemory<Line<In>>;
 
-    fn null_input(#[comptime] line_size: u32) -> Line<In> {
+    fn identity_input(#[comptime] line_size: u32) -> Line<In> {
         Line::empty(line_size).fill(In::from_int(1))
     }
 
-    fn null_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem {
-        Self::null_input(line_size)
+    fn identity_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem {
+        Self::identity_input(line_size)
     }
 
     fn assign_accumulator(destination: &mut Self::AccumulatorItem, source: &Self::AccumulatorItem) {
         *destination = *source;
     }
 
-    fn reduce(
+    fn operate(
         accumulator: &Self::AccumulatorItem,
         item: Line<In>,
         _coordinate: ReduceCoordinate,

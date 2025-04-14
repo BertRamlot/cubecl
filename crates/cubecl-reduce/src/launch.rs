@@ -157,7 +157,7 @@ fn elected_writer(#[comptime] settings: ReduceParams) -> bool {
 }
 
 #[cube]
-fn write_to_output<In: Numeric, Out: Numeric, R: ReduceInstruction<In>>(
+fn write_to_output<In: Numeric, Out: Numeric, R: MonoidOperation<In>>(
     output: &mut VirtualTensor<Out, ReadWrite>,
     accumulator: R::AccumulatorItem,
     reduce_index: u32,

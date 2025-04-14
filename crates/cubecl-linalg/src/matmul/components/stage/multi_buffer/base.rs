@@ -17,7 +17,7 @@ use core::any::TypeId;
 use core::marker::PhantomData;
 use cubecl::prelude::*;
 use cubecl_core as cubecl;
-use cubecl_reduce::ReduceInstruction;
+use cubecl_reduce::MonoidOperation;
 use cubecl_reduce::instructions::MaxAbs;
 use cubecl_reduce::primitives::ReduceRange;
 use cubecl_reduce::primitives::reduce_slice_shared;

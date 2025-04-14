@@ -1,7 +1,7 @@
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 
-use super::{Reduce, ReduceCoordinate, ReduceInstruction, Sum};
+use super::{Reduce, ReduceCoordinate, MonoidOperation, Sum};
 
 #[derive(Debug)]
 pub struct Mean;
@@ -11,31 +11,31 @@ impl Reduce for Mean {
 }
 
 #[cube]
-impl<In: Numeric> ReduceInstruction<In> for Mean {
+impl<In: Numeric> MonoidOperation<In> for Mean {
     const REQUIRES_COORDINATE: bool = false;
 
     type AccumulatorItem = Line<In>;
     type SharedAccumulator = SharedMemory<Line<In>>;
 
-    fn null_input(#[comptime] line_size: u32) -> Line<In> {
-        Sum::null_input(line_size)
+    fn identity_input(#[comptime] line_size: u32) -> Line<In> {
+        Sum::identity_input(line_size)
     }
 
-    fn null_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem {
-        Sum::null_accumulator(line_size)
+    fn identity_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem {
+        Sum::identity_accumulator(line_size)
     }
 
     fn assign_accumulator(destination: &mut Self::AccumulatorItem, source: &Self::AccumulatorItem) {
         Sum::assign_accumulator(destination, source);
     }
 
-    fn reduce(
+    fn operate(
         accumulator: &Self::AccumulatorItem,
         item: Line<In>,
         _coordinate: ReduceCoordinate,
         #[comptime] use_planes: bool,
     ) -> Self::AccumulatorItem {
-        Sum::reduce(accumulator, item, _coordinate, use_planes)
+        Sum::operate(accumulator, item, _coordinate, use_planes)
     }
 
     fn fuse_accumulators(

@@ -2,7 +2,7 @@ use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 
 pub trait Reduce: Send + Sync + 'static + std::fmt::Debug {
-    type Instruction<In: Numeric>: ReduceInstruction<In>;
+    type Instruction<In: Numeric>: MonoidOperation<In>;
 }
 
 /// An instruction for a reduce algorithm that works with [`Line`].
@@ -14,7 +14,7 @@ pub trait Reduce: Send + Sync + 'static + std::fmt::Debug {
 /// with their coordinate into an `AccumulatorItem`. Then, multiple `AccumulatorItem` are possibly fused
 /// together into a single accumulator that is converted to the expected output type.
 #[cube]
-pub trait ReduceInstruction<In: Numeric>: Send + Sync + 'static + std::fmt::Debug {
+pub trait MonoidOperation<In: Numeric>: Send + Sync + 'static + std::fmt::Debug {
     /// If the instruction requires the coordinate to be passed as input.
     const REQUIRES_COORDINATE: bool;
     /// The intermediate state into which we accumulate new input elements.
@@ -28,11 +28,11 @@ pub trait ReduceInstruction<In: Numeric>: Send + Sync + 'static + std::fmt::Debu
 
     /// A input such that `Self::reduce(accumulator, Self::null_input(), coordinate, use_planes)`
     /// is guaranteed to return `accumulator` unchanged for any choice of `coordinate`.
-    fn null_input(#[comptime] line_size: u32) -> Line<In>;
+    fn identity_input(#[comptime] line_size: u32) -> Line<In>;
 
     /// A accumulator such that `Self::fuse_accumulators(accumulator, Self::null_accumulator()` always returns
     /// is guaranteed to return `accumulator` unchanged.
-    fn null_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem;
+    fn identity_accumulator(#[comptime] line_size: u32) -> Self::AccumulatorItem;
 
     /// Assign the value of `source` into `destination`.
     /// In spirit, this is equivalent to `destination = source;`,
@@ -41,7 +41,7 @@ pub trait ReduceInstruction<In: Numeric>: Send + Sync + 'static + std::fmt::Debu
 
     /// If `use_planes` is `true`, reduce all the `item` and `coordinate` within the `accumulator`.
     /// Else, reduce the given `item` and `coordinate` into the accumulator.
-    fn reduce(
+    fn operate(
         accumulator: &Self::AccumulatorItem,
         item: Line<In>,
         coordinate: ReduceCoordinate,
@@ -128,18 +128,18 @@ impl<In: Numeric> SharedAccumulator<In> for ArgAccumulator<In> {
 }
 
 #[cube]
-pub fn reduce_inplace<In: Numeric, R: ReduceInstruction<In>>(
+pub fn reduce_inplace<In: Numeric, R: MonoidOperation<In>>(
     accumulator: &mut R::AccumulatorItem,
     item: Line<In>,
     coordinate: ReduceCoordinate,
     #[comptime] use_planes: bool,
 ) {
-    let reduction = &R::reduce(accumulator, item, coordinate, use_planes);
+    let reduction = &R::operate(accumulator, item, coordinate, use_planes);
     R::assign_accumulator(accumulator, reduction);
 }
 
 #[cube]
-pub fn reduce_shared_inplace<In: Numeric, R: ReduceInstruction<In>>(
+pub fn reduce_shared_inplace<In: Numeric, R: MonoidOperation<In>>(
     accumulator: &mut R::SharedAccumulator,
     index: u32,
     item: Line<In>,
@@ -147,12 +147,12 @@ pub fn reduce_shared_inplace<In: Numeric, R: ReduceInstruction<In>>(
     #[comptime] use_planes: bool,
 ) {
     let acc_item = R::SharedAccumulator::read(accumulator, index);
-    let reduction = R::reduce(&acc_item, item, coordinate, use_planes);
+    let reduction = R::operate(&acc_item, item, coordinate, use_planes);
     R::SharedAccumulator::write(accumulator, index, reduction);
 }
 
 #[cube]
-pub fn fuse_accumulator_inplace<In: Numeric, R: ReduceInstruction<In>>(
+pub fn fuse_accumulator_inplace<In: Numeric, R: MonoidOperation<In>>(
     accumulator: &mut R::SharedAccumulator,
     destination: u32,
     origin: u32,
