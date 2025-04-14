@@ -17,8 +17,6 @@ impl ReduceFamily for MaxAbs {
 
 #[cube]
 impl<In: Numeric> MonoidOperation<In> for MaxAbs {
-    const REQUIRES_COORDINATE: bool = false;
-
     type AccumulatorItem = Line<In>;
     type SharedAccumulator = SharedMemory<Line<In>>;
     type Config = ();
@@ -46,7 +44,7 @@ impl<In: Numeric> MonoidOperation<In> for MaxAbs {
         *destination = *source;
     }
 
-    fn reduce(
+    fn operate(
         _this: &Self,
         accumulator: &Self::AccumulatorItem,
         item: Line<In>,

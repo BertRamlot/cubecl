@@ -39,11 +39,11 @@ pub trait MonoidOperation<In: Numeric>:
     type SharedAccumulator: SharedAccumulator<In, Item = Self::AccumulatorItem>;
 
     fn from_config(#[comptime] config: Self::Config) -> Self;
-    /// A input such that `Self::reduce(accumulator, Self::null_input(), coordinate, use_planes)`
+    /// A input such that `Self::operate(accumulator, Self::identity_input(), coordinate, use_planes)`
     /// is guaranteed to return `accumulator` unchanged for any choice of `coordinate`.
     fn identity_input(this: &Self, #[comptime] line_size: u32) -> Line<In>;
 
-    /// A accumulator such that `Self::fuse_accumulators(accumulator, Self::null_accumulator()` always returns
+    /// A accumulator such that `Self::fuse_accumulators(accumulator, Self::identity_accumulator()` always returns
     /// is guaranteed to return `accumulator` unchanged.
     fn identity_accumulator(this: &Self, #[comptime] line_size: u32) -> Self::AccumulatorItem;
 

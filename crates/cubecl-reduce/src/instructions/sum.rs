@@ -13,8 +13,6 @@ impl ReduceFamily for Sum {
 
 #[cube]
 impl<In: Numeric> MonoidOperation<In> for Sum {
-    const REQUIRES_COORDINATE: bool = false;
-
     type AccumulatorItem = Line<In>;
     type SharedAccumulator = SharedMemory<Line<In>>;
     type Config = ();

@@ -3,7 +3,7 @@ use cubecl_core::prelude::*;
 
 use crate::instructions::ReduceRequirements;
 
-use super::{ReduceCoordinate, ReduceFamily, ReduceInstruction};
+use super::{ReduceCoordinate, ReduceFamily, MonoidOperation};
 
 // TODO Add to test framework.
 /// Return the item with the maximum absolute value.
@@ -16,7 +16,7 @@ impl ReduceFamily for Min {
 }
 
 #[cube]
-impl<In: Numeric> ReduceInstruction<In> for Min {
+impl<In: Numeric> MonoidOperation<In> for Min {
     type AccumulatorItem = Line<In>;
     type SharedAccumulator = SharedMemory<Line<In>>;
     type Config = ();
@@ -28,12 +28,12 @@ impl<In: Numeric> ReduceInstruction<In> for Min {
     fn from_config(_config: Self::Config) -> Self {
         Min {}
     }
-    fn null_input(_this: &Self, #[comptime] line_size: u32) -> Line<In> {
+    fn identity_input(_this: &Self, #[comptime] line_size: u32) -> Line<In> {
         Line::empty(line_size).fill(In::max_value())
     }
 
-    fn null_accumulator(this: &Self, #[comptime] line_size: u32) -> Self::AccumulatorItem {
-        Self::null_input(this, line_size)
+    fn identity_accumulator(this: &Self, #[comptime] line_size: u32) -> Self::AccumulatorItem {
+        Self::identity_input(this, line_size)
     }
 
     fn assign_accumulator(
@@ -44,7 +44,7 @@ impl<In: Numeric> ReduceInstruction<In> for Min {
         *destination = *source;
     }
 
-    fn reduce(
+    fn operate(
         _this: &Self,
         accumulator: &Self::AccumulatorItem,
         item: Line<In>,

@@ -6,8 +6,8 @@
 //! This is often also called folding.
 //!
 //! This crate provides a main entrypoint as the [`reduce`] function which allows to automatically
-//! perform a reduction for a given instruction implementing the [`ReduceInstruction`] trait and a given [`ReduceStrategy`].
-//! It also provides implementation of the [`ReduceInstruction`] trait for common operations in the [`instructions`] module.
+//! perform a reduction for a given instruction implementing the [`MonoidOperation`] trait and a given [`ReduceStrategy`].
+//! It also provides implementation of the [`MonoidOperation`] trait for common operations in the [`instructions`] module.
 //! Finally, it provides many reusable primitives to perform different general reduction algorithms in the [`primitives`] module.
 
 pub mod args;
@@ -40,7 +40,7 @@ use cubecl_core::prelude::*;
 
 
 /// Contains scan kernels
-pub mod scan;
+// pub mod scan;
 
 
 /// Reduce the given `axis` of the `input` tensor using the instruction `Inst` and write the result into `output`.
